@@ -56,6 +56,7 @@ set -u
 fm_git_identity fmtest fmtest@example.invalid
 
 TEARDOWN="$ROOT/bin/fm-teardown.sh"
+ROUTE="$ROOT/bin/fm-route.sh"
 PR_CHECK="$ROOT/bin/fm-pr-check.sh"
 TMP_ROOT=$(fm_test_tmproot fm-teardown-tests)
 REAL_GIT_FOR_TEST=$(command -v git)
@@ -208,6 +209,442 @@ write_meta() {
     "project=$case_dir/project" \
     "kind=$kind" \
     "mode=$mode"
+}
+
+route_claim_path() {
+  printf '%s/routing/claims/%s/%s.cap\n' "$1/state" "$2" "$3"
+}
+
+route_reservation_path() {
+  printf '%s/routing/reservations/%s/%s.json\n' "$1/state" "$2" "$3"
+}
+
+make_active_routed_task() {
+  local case_dir=$1 generation=${2:-gen-task-x1} work_type=${3:-review} metadata capability candidate
+  metadata="$case_dir/state/task-x1.meta"
+  capability=$(route_claim_path "$case_dir" task-x1 "$generation")
+  candidate="$metadata.route-candidate"
+  fm_test_reserve_bound "$ROOT" "$case_dir" "$case_dir/state" task-x1 "$generation" \
+    profile-1 openai codex-primary codex-primary standard "$work_type" medium automatic \
+    claude claude-test none 100 >/dev/null
+  FM_HOME="$case_dir" FM_STATE_OVERRIDE="$case_dir/state" "$ROUTE" begin-admission \
+    --task task-x1 --generation "$generation" --profile profile-1 \
+    --provider openai --lane codex-primary --account codex-primary \
+    --class standard --work-type "$work_type" --risk medium --mode automatic --transition fresh \
+    --launch-harness claude --launch-model claude-test --launch-effort none \
+    --metadata-file "$metadata" --claim-file "$capability" >/dev/null
+  cp "$metadata" "$candidate"
+  awk 'BEGIN{done=0} /^model=/{print "model=claude-test"; done=1; next} {print} END{if (!done) print "model=claude-test"}' \
+    "$candidate" >"$candidate.model"
+  mv "$candidate.model" "$candidate"
+  {
+    printf 'harness=claude\n'
+    printf 'effort=default\n'
+    printf 'route_generation=%s\n' "$generation"
+    printf 'route_profile=profile-1\n'
+    printf 'route_provider=openai\n'
+    printf 'route_lane=codex-primary\n'
+    printf 'route_account=codex-primary\n'
+    printf 'route_class=standard\n'
+    printf 'route_work_type=%s\n' "$work_type"
+    printf 'route_risk=medium\n'
+    printf 'route_mode=automatic\n'
+  } >>"$candidate"
+  FM_STATE_OVERRIDE="$case_dir/state" "$ROUTE" prepare-admission \
+    --task task-x1 --candidate "$candidate" --claim-file "$capability" >/dev/null
+  mv "$candidate" "$metadata"
+  FM_STATE_OVERRIDE="$case_dir/state" "$ROUTE" commit-admission \
+    --task task-x1 --claim-file "$capability" >/dev/null
+}
+
+make_stale_inherited_admission() {
+  local case_dir=$1 metadata capability journal reservation old
+  metadata="$case_dir/state/task-x1.meta"
+  capability=$(route_claim_path "$case_dir" task-x1 gen-task-x1)
+  journal="$case_dir/state/routing/admissions/task-x1.json"
+  reservation=$(route_reservation_path "$case_dir" task-x1 gen-task-x1)
+  (FM_HOME="$case_dir" FM_STATE_OVERRIDE="$case_dir/state" "$ROUTE" begin-admission \
+    --task task-x1 --generation gen-task-x1 --profile profile-1 \
+    --provider openai --lane codex-primary --account codex-primary \
+    --class standard --work-type review --risk medium --mode automatic --transition inherit \
+    --launch-harness claude --launch-model claude-test --launch-effort none \
+    --metadata-file "$metadata" --claim-file "$capability" >/dev/null) &
+  wait "$!" || fail "stale inherited admission setup failed"
+  old=$(( $(date +%s) - 301 ))
+  jq --argjson old "$old" '.createdAt=$old | .ownerPid=99999999 | .ownerStart=("a" * 64)' \
+    "$journal" >"$journal.next"
+  mv "$journal.next" "$journal"
+  jq --argjson old "$old" '.claimedAt=$old | .ownerPid=99999999 | .ownerStart=("a" * 64)' \
+    "$reservation" >"$reservation.next"
+  mv "$reservation.next" "$reservation"
+}
+
+add_routed_tmux_close_mock() {
+  local case_dir=$1
+  cat >"$case_dir/fakebin/tmux" <<'SH'
+#!/usr/bin/env bash
+case "${1:-}" in
+  list-windows)
+    count=0
+    [ ! -f "${FM_TM_CLOSE_COUNT:?}" ] || count=$(cat "$FM_TM_CLOSE_COUNT")
+    if [ "$count" -eq 0 ]; then
+      printf 'fm-task-x1\n'
+      exit 0
+    fi
+    case "${FM_TM_CLOSE_MODE:?}" in
+      still-live) printf 'fm-task-x1\n'; exit 0 ;;
+      unverifiable) printf 'tmux inventory unavailable\n' >&2; exit 1 ;;
+      success) exit 0 ;;
+    esac
+    ;;
+  kill-window)
+    count=0
+    [ ! -f "${FM_TM_CLOSE_COUNT:?}" ] || count=$(cat "$FM_TM_CLOSE_COUNT")
+    count=$((count + 1))
+    printf '%s\n' "$count" >"$FM_TM_CLOSE_COUNT"
+    [ "${FM_TM_CLOSE_MODE:?}" != kill-failure ] || exit 1
+    exit 0
+    ;;
+esac
+exit 0
+SH
+  chmod +x "$case_dir/fakebin/tmux"
+}
+
+test_refused_teardown_keeps_routed_generation() {
+  local case_dir reservation capability
+  case_dir=$(make_case routed-refusal)
+  write_meta "$case_dir" no-mistakes ship
+  make_active_routed_task "$case_dir"
+  reservation=$(route_reservation_path "$case_dir" task-x1 gen-task-x1)
+  capability=$(route_claim_path "$case_dir" task-x1 gen-task-x1)
+  printf 'dirty\n' >"$case_dir/wt/uncommitted.txt"
+
+  if run_teardown "$case_dir" >/dev/null 2>&1; then
+    fail "routed refusal unexpectedly succeeded"
+  fi
+  [ -f "$case_dir/state/task-x1.meta" ] || fail "routed refusal removed task metadata"
+  [ -f "$reservation" ] || fail "routed refusal released live capacity"
+  [ -f "$capability" ] || fail "routed refusal removed its protected capability"
+  [ ! -e "$case_dir/state/routing/outcomes.jsonl" ] || fail "routed refusal wrote a terminal outcome"
+  pass "refused cleanup preserves the exact routed generation"
+}
+
+test_successful_teardown_finalizes_routed_generation_once() {
+  local terminal case_dir reservation capability outcomes count
+  for terminal in completed failed_safe escalated cancelled superseded; do
+    case_dir=$(make_case "routed-success-$terminal")
+    write_meta "$case_dir" no-mistakes ship
+    make_active_routed_task "$case_dir"
+    reservation=$(route_reservation_path "$case_dir" task-x1 gen-task-x1)
+    capability=$(route_claim_path "$case_dir" task-x1 gen-task-x1)
+    outcomes="$case_dir/state/routing/outcomes.jsonl"
+    FM_STATE_OVERRIDE="$case_dir/state" "$ROUTE" score --task task-x1 \
+      --generation gen-task-x1 --terminal "$terminal" --tests unknown \
+      --review unknown --redundant no --now 1000 >/dev/null
+
+    run_teardown "$case_dir" >/dev/null || fail "teardown rejected resolved terminal $terminal"
+    [ ! -e "$reservation" ] || fail "$terminal cleanup leaked routed capacity"
+    [ ! -e "$capability" ] || fail "$terminal cleanup leaked its capability"
+    count=$(jq -s '[.[] | select(.taskId == "task-x1" and .generation == "gen-task-x1")] | length' "$outcomes")
+    [ "$count" -eq 1 ] || fail "$terminal cleanup wrote $count generation outcomes"
+    jq -e --arg terminal "$terminal" \
+      'select(.taskId == "task-x1") | .workType == "review" and .terminal == $terminal and .tests == "unknown" and .review == "unknown" and .redundant == "no"' \
+      "$outcomes" >/dev/null || fail "teardown did not preserve the pending $terminal score"
+
+    if run_teardown "$case_dir" >/dev/null 2>&1; then
+      fail "$terminal teardown replay without task metadata unexpectedly succeeded"
+    fi
+    [ "$(jq -s '[.[] | select(.taskId == "task-x1" and .generation == "gen-task-x1")] | length' "$outcomes")" -eq 1 ] \
+      || fail "$terminal cleanup replay duplicated the terminal outcome"
+  done
+  pass "successful cleanup finalizes every terminal enum exactly once"
+}
+
+test_teardown_accepts_legacy_eight_field_route_metadata() {
+  local case_dir metadata outcomes
+  case_dir=$(make_case routed-legacy-metadata)
+  write_meta "$case_dir" no-mistakes ship
+  make_active_routed_task "$case_dir" gen-task-x1 implementation
+  metadata="$case_dir/state/task-x1.meta"
+  sed '/^route_work_type=/d' "$metadata" > "$metadata.legacy"
+  mv "$metadata.legacy" "$metadata"
+  outcomes="$case_dir/state/routing/outcomes.jsonl"
+
+  run_teardown "$case_dir" >/dev/null
+  jq -e 'select(.taskId == "task-x1") | .workType == "implementation" and .terminal == "completed"' \
+    "$outcomes" >/dev/null \
+    || fail "legacy routed teardown did not derive work type from its exact reservation"
+  pass "legacy eight-field routed metadata finalizes through its authoritative reservation"
+}
+
+test_legacy_teardown_replays_after_terminal_ledger_publish() {
+  local case_dir metadata outcomes
+  case_dir=$(make_case routed-legacy-ledger)
+  write_meta "$case_dir" no-mistakes ship
+  make_active_routed_task "$case_dir" gen-task-x1 implementation
+  metadata="$case_dir/state/task-x1.meta"
+  sed '/^route_work_type=/d' "$metadata" > "$metadata.legacy"
+  mv "$metadata.legacy" "$metadata"
+  outcomes="$case_dir/state/routing/outcomes.jsonl"
+  FM_STATE_OVERRIDE="$case_dir/state" "$ROUTE" cleanup-finalize \
+    --task task-x1 --generation gen-task-x1 --profile profile-1 \
+    --provider openai --lane codex-primary --account codex-primary \
+    --class standard --work-type implementation --risk medium --mode automatic \
+    --terminal completed >/dev/null
+
+  run_teardown "$case_dir" >/dev/null
+  [ ! -e "$metadata" ] || fail "legacy ledger-published cleanup replay retained metadata"
+  [ "$(jq -s '[.[] | select(.taskId == "task-x1" and .generation == "gen-task-x1")] | length' "$outcomes")" -eq 1 ] \
+    || fail "legacy ledger-published cleanup replay duplicated its outcome"
+  pass "legacy eight-field cleanup replays from its exact terminal outcome"
+}
+
+test_missing_routing_capability_refuses_before_cleanup() {
+  local case_dir reservation capability
+  case_dir=$(make_case routed-missing-capability)
+  write_meta "$case_dir" no-mistakes ship
+  make_active_routed_task "$case_dir"
+  reservation=$(route_reservation_path "$case_dir" task-x1 gen-task-x1)
+  capability=$(route_claim_path "$case_dir" task-x1 gen-task-x1)
+  rm -f "$capability"
+
+  if run_teardown "$case_dir" >"$case_dir/stdout" 2>"$case_dir/stderr"; then
+    fail "cleanup ignored a missing routing capability"
+  fi
+  [ -f "$case_dir/state/task-x1.meta" ] || fail "missing capability was detected after durable cleanup"
+  [ -f "$reservation" ] || fail "missing capability released routed capacity"
+  [ -d "$case_dir/wt" ] || fail "missing capability was detected after worktree return"
+  [ ! -e "$case_dir/state/routing/outcomes.jsonl" ] || fail "missing capability wrote an outcome"
+  pass "missing routing capability refuses before durable cleanup"
+}
+
+test_routed_finalization_failure_after_return_converges_on_retry() {
+  local case_dir capability reservation outcomes saved
+  case_dir=$(make_case routed-finalize-retry)
+  write_meta "$case_dir" no-mistakes ship
+  make_active_routed_task "$case_dir"
+  capability=$(route_claim_path "$case_dir" task-x1 gen-task-x1)
+  reservation=$(route_reservation_path "$case_dir" task-x1 gen-task-x1)
+  outcomes="$case_dir/state/routing/outcomes.jsonl"
+  saved="$case_dir/saved.cap"
+  cp "$capability" "$saved"
+  cat >"$case_dir/fakebin/treehouse" <<'SH'
+#!/usr/bin/env bash
+if [ "${1:-}" = return ] && [ ! -e "${FM_FINALIZE_FAULT_MARKER:?}" ]; then
+  printf 'corrupt\n' >"${FM_FINALIZE_FAULT_CAPABILITY:?}"
+  : >"$FM_FINALIZE_FAULT_MARKER"
+fi
+exit 0
+SH
+  chmod +x "$case_dir/fakebin/treehouse"
+
+  FM_FINALIZE_FAULT_MARKER="$case_dir/returned" \
+  FM_FINALIZE_FAULT_CAPABILITY="$capability" \
+    run_teardown "$case_dir" >"$case_dir/stdout" 2>"$case_dir/stderr" \
+    && fail "post-return capability fault unexpectedly finalized"
+  [ -e "$case_dir/returned" ] || fail "finalization ran before worktree return"
+  [ -f "$case_dir/state/task-x1.meta" ] || fail "post-return finalization failure removed task metadata"
+  [ -f "$reservation" ] || fail "post-return finalization failure released capacity"
+  [ ! -e "$outcomes" ] || fail "post-return finalization failure wrote an outcome"
+
+  cp "$saved" "$capability"
+  chmod 600 "$capability"
+  FM_FINALIZE_FAULT_MARKER="$case_dir/returned" \
+  FM_FINALIZE_FAULT_CAPABILITY="$capability" \
+    run_teardown "$case_dir" >/dev/null
+  [ ! -e "$reservation" ] || fail "finalization retry leaked capacity"
+  [ "$(jq -s '[.[] | select(.taskId == "task-x1" and .generation == "gen-task-x1")] | length' "$outcomes")" -eq 1 ] \
+    || fail "finalization retry did not converge to one outcome"
+  pass "post-return finalization failures preserve a retryable exact generation"
+}
+
+test_teardown_replays_after_terminal_ledger_publish() {
+  local case_dir outcomes
+  case_dir=$(make_case routed-ledger-published)
+  write_meta "$case_dir" no-mistakes ship
+  make_active_routed_task "$case_dir"
+  outcomes="$case_dir/state/routing/outcomes.jsonl"
+  FM_STATE_OVERRIDE="$case_dir/state" "$ROUTE" score --task task-x1 \
+    --generation gen-task-x1 --terminal failed_safe --tests fail \
+    --review unknown --redundant no --now 1010 >/dev/null
+  FM_STATE_OVERRIDE="$case_dir/state" "$ROUTE" cleanup-finalize \
+    --task task-x1 --generation gen-task-x1 --profile profile-1 \
+    --provider openai --lane codex-primary --account codex-primary \
+    --class standard --work-type review --risk medium --mode automatic --terminal failed_safe >/dev/null
+  [ -f "$case_dir/state/task-x1.meta" ] || fail "ledger-publish crash setup lost task metadata"
+
+  run_teardown "$case_dir" >/dev/null
+  [ ! -e "$case_dir/state/task-x1.meta" ] || fail "ledger-published cleanup replay retained metadata"
+  [ "$(jq -s '[.[] | select(.taskId == "task-x1" and .generation == "gen-task-x1")] | length' "$outcomes")" -eq 1 ] \
+    || fail "ledger-published cleanup replay duplicated its outcome"
+  jq -e 'select(.taskId == "task-x1") | .terminal == "failed_safe"' "$outcomes" >/dev/null \
+    || fail "cleanup replay changed the published terminal outcome"
+  pass "cleanup replay converges from the authoritative terminal ledger outcome"
+}
+
+test_concurrent_score_change_retains_metadata_then_retry_converges() {
+  local case_dir metadata reservation capability outcomes
+  case_dir=$(make_case routed-concurrent-score)
+  write_meta "$case_dir" no-mistakes ship
+  make_active_routed_task "$case_dir"
+  metadata="$case_dir/state/task-x1.meta"
+  reservation=$(route_reservation_path "$case_dir" task-x1 gen-task-x1)
+  capability=$(route_claim_path "$case_dir" task-x1 gen-task-x1)
+  outcomes="$case_dir/state/routing/outcomes.jsonl"
+  cat >"$case_dir/fakebin/treehouse" <<SH
+#!/usr/bin/env bash
+if [ "\${1:-}" = return ] && [ ! -e "$case_dir/score-changed" ]; then
+  FM_STATE_OVERRIDE="$case_dir/state" "$ROUTE" score --task task-x1 \
+    --generation gen-task-x1 --terminal failed_safe --tests fail \
+    --review unknown --redundant no --now 1010 >/dev/null || exit 1
+  : >"$case_dir/score-changed"
+fi
+exit 0
+SH
+  chmod +x "$case_dir/fakebin/treehouse"
+
+  if run_teardown "$case_dir" >"$case_dir/stdout" 2>"$case_dir/stderr"; then
+    fail "concurrent score change unexpectedly finalized the stale completed resolution"
+  fi
+  [ -e "$case_dir/score-changed" ] || fail "concurrent score change did not occur after cleanup preflight"
+  [ -f "$metadata" ] || fail "concurrent score change failure removed retry metadata"
+  [ -f "$reservation" ] || fail "concurrent score change failure released capacity"
+  [ -f "$capability" ] || fail "concurrent score change failure removed capability"
+  [ ! -e "$outcomes" ] || fail "concurrent score change wrote a stale terminal outcome"
+
+  run_teardown "$case_dir" >/dev/null || fail "retry did not resolve the newly scored terminal"
+  [ ! -e "$reservation" ] || fail "score-change retry leaked capacity"
+  [ ! -e "$capability" ] || fail "score-change retry leaked capability"
+  jq -e 'select(.taskId == "task-x1") | .terminal == "failed_safe" and .tests == "fail" and .review == "unknown"' \
+    "$outcomes" >/dev/null || fail "score-change retry did not converge to the authoritative pending score"
+  [ "$(jq -s '[.[] | select(.taskId == "task-x1" and .generation == "gen-task-x1")] | length' "$outcomes")" -eq 1 ] \
+    || fail "score-change retry did not write exactly one outcome"
+  pass "concurrent score change fails stale finalization safely and converges on retry"
+}
+
+test_dirty_refusal_does_not_recover_stale_routing_admission() {
+  local case_dir reservation capability journal before_res before_cap before_journal
+  case_dir=$(make_case routed-stale-dirty)
+  write_meta "$case_dir" no-mistakes ship
+  make_active_routed_task "$case_dir"
+  make_stale_inherited_admission "$case_dir"
+  reservation=$(route_reservation_path "$case_dir" task-x1 gen-task-x1)
+  capability=$(route_claim_path "$case_dir" task-x1 gen-task-x1)
+  journal="$case_dir/state/routing/admissions/task-x1.json"
+  before_res=$(od -An -v -tx1 "$reservation")
+  before_cap=$(od -An -v -tx1 "$capability")
+  before_journal=$(od -An -v -tx1 "$journal")
+  printf 'dirty\n' >"$case_dir/wt/uncommitted.txt"
+
+  if run_teardown "$case_dir" >/dev/null 2>&1; then
+    fail "dirty routed task with stale admission unexpectedly cleaned up"
+  fi
+  [ "$(od -An -v -tx1 "$reservation")" = "$before_res" ] || fail "dirty refusal mutated stale reservation bytes"
+  [ "$(od -An -v -tx1 "$capability")" = "$before_cap" ] || fail "dirty refusal mutated capability bytes"
+  [ "$(od -An -v -tx1 "$journal")" = "$before_journal" ] || fail "dirty refusal recovered the admission journal"
+  [ ! -e "$case_dir/state/routing/outcomes.jsonl" ] || fail "dirty refusal wrote an outcome"
+  pass "dirty refusal leaves stale admission routing bytes unchanged"
+}
+
+test_route_tuple_conflict_preflight_is_read_only() {
+  local case_dir reservation capability journal before_res before_cap before_journal
+  case_dir=$(make_case routed-stale-conflict)
+  write_meta "$case_dir" no-mistakes ship
+  make_active_routed_task "$case_dir"
+  make_stale_inherited_admission "$case_dir"
+  reservation=$(route_reservation_path "$case_dir" task-x1 gen-task-x1)
+  capability=$(route_claim_path "$case_dir" task-x1 gen-task-x1)
+  journal="$case_dir/state/routing/admissions/task-x1.json"
+  before_res=$(od -An -v -tx1 "$reservation")
+  before_cap=$(od -An -v -tx1 "$capability")
+  before_journal=$(od -An -v -tx1 "$journal")
+  sed 's/^route_profile=.*/route_profile=conflicting-profile/' "$case_dir/state/task-x1.meta" >"$case_dir/state/task-x1.meta.next"
+  mv "$case_dir/state/task-x1.meta.next" "$case_dir/state/task-x1.meta"
+
+  if run_teardown "$case_dir" >/dev/null 2>&1; then
+    fail "route tuple conflict unexpectedly cleaned up"
+  fi
+  [ "$(od -An -v -tx1 "$reservation")" = "$before_res" ] || fail "tuple conflict mutated reservation bytes"
+  [ "$(od -An -v -tx1 "$capability")" = "$before_cap" ] || fail "tuple conflict mutated capability bytes"
+  [ "$(od -An -v -tx1 "$journal")" = "$before_journal" ] || fail "tuple conflict recovered the journal"
+  [ ! -e "$case_dir/state/routing/outcomes.jsonl" ] || fail "tuple conflict wrote an outcome"
+  pass "route tuple conflict preflight leaves routing bytes unchanged"
+}
+
+test_terminal_conflict_preflight_is_read_only() {
+  local case_dir outcomes reservation capability before_outcome before_reservation before_capability before_meta
+  case_dir=$(make_case routed-terminal-conflict)
+  write_meta "$case_dir" no-mistakes ship
+  make_active_routed_task "$case_dir"
+  outcomes="$case_dir/state/routing/outcomes.jsonl"
+  reservation=$(route_reservation_path "$case_dir" task-x1 gen-task-x1)
+  capability=$(route_claim_path "$case_dir" task-x1 gen-task-x1)
+  FM_STATE_OVERRIDE="$case_dir/state" "$ROUTE" score --task task-x1 \
+    --generation gen-task-x1 --terminal failed_safe --tests fail \
+    --review unknown --redundant no --now 1010 >/dev/null
+  jq -cn --argjson reservation "$(cat "$reservation")" '
+    {kind:"terminal",timestamp:1010,taskId:$reservation.taskId,generation:$reservation.generation,
+     profile:$reservation.profile,provider:$reservation.provider,lane:$reservation.lane,account:$reservation.account,
+     taskClass:$reservation.taskClass,workType:$reservation.workType,risk:$reservation.risk,mode:$reservation.mode,
+     elapsedSeconds:10,tests:"unknown",review:"unknown",redundant:"no",terminal:"completed"}
+  ' >"$outcomes"
+  before_outcome=$(od -An -v -tx1 "$outcomes")
+  before_reservation=$(od -An -v -tx1 "$reservation")
+  before_capability=$(od -An -v -tx1 "$capability")
+  before_meta=$(od -An -v -tx1 "$case_dir/state/task-x1.meta")
+
+  if run_teardown "$case_dir" >/dev/null 2>&1; then
+    fail "terminal conflict unexpectedly cleaned up"
+  fi
+  [ "$(od -An -v -tx1 "$outcomes")" = "$before_outcome" ] || fail "terminal conflict mutated outcome bytes"
+  [ "$(od -An -v -tx1 "$reservation")" = "$before_reservation" ] || fail "terminal conflict mutated reservation bytes"
+  [ "$(od -An -v -tx1 "$capability")" = "$before_capability" ] || fail "terminal conflict mutated capability bytes"
+  [ "$(od -An -v -tx1 "$case_dir/state/task-x1.meta")" = "$before_meta" ] || fail "terminal conflict mutated task metadata"
+  [ -d "$case_dir/wt" ] || fail "terminal conflict reached worktree return"
+  pass "terminal conflict preflight leaves outcome and task bytes unchanged"
+}
+
+test_routed_cleanup_requires_confirmed_endpoint_absence() {
+  local mode case_dir reservation capability outcomes
+  for mode in kill-failure still-live unverifiable; do
+    case_dir=$(make_case "routed-close-$mode")
+    write_meta "$case_dir" no-mistakes ship
+    make_active_routed_task "$case_dir"
+    add_routed_tmux_close_mock "$case_dir"
+    reservation=$(route_reservation_path "$case_dir" task-x1 gen-task-x1)
+    capability=$(route_claim_path "$case_dir" task-x1 gen-task-x1)
+    outcomes="$case_dir/state/routing/outcomes.jsonl"
+    if FM_TM_CLOSE_MODE="$mode" FM_TM_CLOSE_COUNT="$case_dir/close-count" \
+      run_teardown "$case_dir" >"$case_dir/stdout" 2>"$case_dir/stderr"; then
+      fail "routed cleanup accepted endpoint close mode $mode"
+    fi
+    [ -f "$case_dir/state/task-x1.meta" ] || fail "$mode endpoint result removed task metadata"
+    [ -f "$reservation" ] || fail "$mode endpoint result released capacity"
+    [ -f "$capability" ] || fail "$mode endpoint result removed capability"
+    [ ! -e "$outcomes" ] || fail "$mode endpoint result wrote a terminal outcome"
+  done
+  pass "routed cleanup rejects kill failure, still-live, and unverifiable endpoints"
+}
+
+test_routed_endpoint_close_retry_finalizes_once() {
+  local case_dir outcomes
+  case_dir=$(make_case routed-close-retry)
+  write_meta "$case_dir" no-mistakes ship
+  make_active_routed_task "$case_dir"
+  add_routed_tmux_close_mock "$case_dir"
+  outcomes="$case_dir/state/routing/outcomes.jsonl"
+  if FM_TM_CLOSE_MODE=kill-failure FM_TM_CLOSE_COUNT="$case_dir/close-count" \
+    run_teardown "$case_dir" >/dev/null 2>&1; then
+    fail "routed close failure unexpectedly succeeded"
+  fi
+  rm -f "$case_dir/close-count"
+  FM_TM_CLOSE_MODE=success FM_TM_CLOSE_COUNT="$case_dir/close-count" \
+    run_teardown "$case_dir" >/dev/null
+  [ ! -e "$case_dir/state/task-x1.meta" ] || fail "confirmed close retry retained metadata"
+  [ "$(jq -s '[.[] | select(.taskId == "task-x1" and .generation == "gen-task-x1")] | length' "$outcomes")" -eq 1 ] \
+    || fail "confirmed close retry did not finalize exactly once"
+  pass "routed cleanup retries after a confirmed endpoint close"
 }
 
 # Commit something on the worktree's task branch. Args: case_dir [message]
@@ -2649,3 +3086,16 @@ test_process_spawned_during_grace_is_reaped_on_later_pass
 test_persistent_scan_refuses_after_bounded_retries
 test_process_exit_during_identity_lookup_does_not_refuse
 test_run_abort_precedes_process_reap_precedes_worktree_removal
+test_refused_teardown_keeps_routed_generation
+test_successful_teardown_finalizes_routed_generation_once
+test_teardown_accepts_legacy_eight_field_route_metadata
+test_legacy_teardown_replays_after_terminal_ledger_publish
+test_missing_routing_capability_refuses_before_cleanup
+test_routed_finalization_failure_after_return_converges_on_retry
+test_teardown_replays_after_terminal_ledger_publish
+test_concurrent_score_change_retains_metadata_then_retry_converges
+test_dirty_refusal_does_not_recover_stale_routing_admission
+test_route_tuple_conflict_preflight_is_read_only
+test_terminal_conflict_preflight_is_read_only
+test_routed_cleanup_requires_confirmed_endpoint_absence
+test_routed_endpoint_close_retry_finalizes_once

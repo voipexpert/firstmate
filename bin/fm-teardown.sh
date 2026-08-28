@@ -255,6 +255,59 @@ fm_lock_acquire_wait "$META_LOCK"
 META_LOCK_HELD=1
 [ -f "$META" ] || { echo "error: no meta for task $ID at $META" >&2; exit 1; }
 
+ROUTE_FINALIZATION_READY=0
+ROUTE_TERMINAL=
+ROUTE_GENERATION=$(fm_meta_get "$META" route_generation)
+ROUTE_PROFILE=$(fm_meta_get "$META" route_profile)
+ROUTE_PROVIDER=$(fm_meta_get "$META" route_provider)
+ROUTE_LANE=$(fm_meta_get "$META" route_lane)
+ROUTE_ACCOUNT=$(fm_meta_get "$META" route_account)
+ROUTE_CLASS=$(fm_meta_get "$META" route_class)
+ROUTE_WORK_TYPE=$(fm_meta_get "$META" route_work_type)
+ROUTE_RISK=$(fm_meta_get "$META" route_risk)
+ROUTE_MODE=$(fm_meta_get "$META" route_mode)
+if [ -z "$ROUTE_WORK_TYPE" ] \
+  && [ -n "$ROUTE_GENERATION" ] && [ -n "$ROUTE_PROFILE" ] \
+  && [ -n "$ROUTE_PROVIDER" ] && [ -n "$ROUTE_LANE" ] \
+  && [ -n "$ROUTE_ACCOUNT" ] && [ -n "$ROUTE_CLASS" ] \
+  && [ -n "$ROUTE_RISK" ] && [ -n "$ROUTE_MODE" ]; then
+  if ! ROUTE_WORK_TYPE=$("$SCRIPT_DIR/fm-route.sh" reservation-work-type \
+    --task "$ID" --generation "$ROUTE_GENERATION" --profile "$ROUTE_PROFILE" \
+    --provider "$ROUTE_PROVIDER" --lane "$ROUTE_LANE" --account "$ROUTE_ACCOUNT" \
+    --class "$ROUTE_CLASS" --risk "$ROUTE_RISK" --mode "$ROUTE_MODE" 2>/dev/null); then
+    echo "REFUSED: legacy routed task metadata does not match its authoritative reservation; preserving task and routing state" >&2
+    exit 1
+  fi
+fi
+ROUTE_FIELD_COUNT=0
+for route_field in "$ROUTE_GENERATION" "$ROUTE_PROFILE" "$ROUTE_PROVIDER" "$ROUTE_LANE" \
+  "$ROUTE_ACCOUNT" "$ROUTE_CLASS" "$ROUTE_WORK_TYPE" "$ROUTE_RISK" "$ROUTE_MODE"; do
+  [ -z "$route_field" ] || ROUTE_FIELD_COUNT=$((ROUTE_FIELD_COUNT + 1))
+done
+if [ "$ROUTE_FIELD_COUNT" -ne 0 ]; then
+  [ "$ROUTE_FIELD_COUNT" -eq 9 ] || {
+    echo "REFUSED: routed task metadata is incomplete; preserving task and routing state" >&2
+    exit 1
+  }
+  if ! ROUTE_RESOLUTION=$("$SCRIPT_DIR/fm-route.sh" cleanup-ready \
+    --task "$ID" --generation "$ROUTE_GENERATION" --profile "$ROUTE_PROFILE" \
+    --provider "$ROUTE_PROVIDER" --lane "$ROUTE_LANE" --account "$ROUTE_ACCOUNT" \
+    --class "$ROUTE_CLASS" --work-type "$ROUTE_WORK_TYPE" --risk "$ROUTE_RISK" --mode "$ROUTE_MODE" \
+  ); then
+    echo "REFUSED: routed task finalization is not ready; preserving task and routing state" >&2
+    exit 1
+  fi
+  ROUTE_TERMINAL=$(jq -er '
+    select(type == "object" and keys == ["terminal"]
+      and (.terminal | IN("completed","failed_safe","escalated","cancelled","superseded")))
+    | .terminal
+  ' <<<"$ROUTE_RESOLUTION" 2>/dev/null) || {
+    echo "REFUSED: routed task finalization returned an invalid terminal resolution; preserving task and routing state" >&2
+    exit 1
+  }
+  ROUTE_FINALIZATION_READY=1
+fi
+
 REMOTE_HANDOFF_DIR_PRESENT=0
 REMOTE_HANDOFF_DIR_REAL=
 REMOTE_OUTBOX_PRESENT=0
@@ -2688,7 +2741,9 @@ if [ "$BACKEND" = orca ] && [ "$KIND" != secondmate ]; then
       "$WT/.opencode/plugins/fm-busy-state.js" \
       "$WT/.fm-grok-turnend" "$WT/.fm-kimi-turnend"
   fi
-  [ -z "$T_ORCA" ] || fm_backend_kill "$BACKEND" "$T" "$(meta_value "$META" zellij_tab_id)" "fm-$ID" 2>/dev/null || true
+  if [ -n "$T_ORCA" ] && [ "$ROUTE_FINALIZATION_READY" != 1 ]; then
+    fm_backend_kill "$BACKEND" "$T" "$(meta_value "$META" zellij_tab_id)" "fm-$ID" 2>/dev/null || true
+  fi
   fm_backend_remove_worktree "$BACKEND" "$ORCA_WORKTREE_ID"
 elif [ -d "$WT" ] && [ "$KIND" != secondmate ]; then
   branch=$(git -C "$WT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo HEAD)
@@ -2758,6 +2813,11 @@ elif [ "$BACKEND" = herdr ]; then
   else
     echo "warning: herdr session presentation lock path is unavailable; skipping the pane close rather than closing unlocked" >&2
   fi
+elif [ "$ROUTE_FINALIZATION_READY" = 1 ]; then
+  fm_backend_close_confirmed "$BACKEND" "$T" "$(meta_value "$META" zellij_tab_id)" "fm-$ID" || {
+    echo "error: routed endpoint $T for $ID was not confirmed closed; retaining task and routing state for retry" >&2
+    exit 1
+  }
 elif [ "$BACKEND" != orca ]; then
   fm_backend_kill "$BACKEND" "$T" "$(meta_value "$META" zellij_tab_id)" "fm-$ID" 2>/dev/null || true
 fi
@@ -2813,6 +2873,16 @@ fm_backend_clear_transition "$BACKEND" "$STATE" "$T" || true
 remove_pr_poll_artifacts "$STATE" "$ID" || exit 1
 retire_busy_state "$STATE" "$ID" "$BUSY_GEN" || exit 1
 status_retire_presentation_task "$STATE" "$ID" || exit 1
+if [ "$ROUTE_FINALIZATION_READY" = 1 ]; then
+  "$SCRIPT_DIR/fm-route.sh" cleanup-finalize \
+    --task "$ID" --generation "$ROUTE_GENERATION" --profile "$ROUTE_PROFILE" \
+    --provider "$ROUTE_PROVIDER" --lane "$ROUTE_LANE" --account "$ROUTE_ACCOUNT" \
+    --class "$ROUTE_CLASS" --work-type "$ROUTE_WORK_TYPE" --risk "$ROUTE_RISK" --mode "$ROUTE_MODE" \
+    --terminal "$ROUTE_TERMINAL" >/dev/null || {
+      echo "error: routed task finalization failed; retaining task metadata for retry" >&2
+      exit 1
+    }
+fi
 rm -f "$STATE/$ID.turn-ended" "$STATE/$ID.meta" \
   "$STATE/$ID.pi-ext.ts" "$STATE/$ID.grok-turnend-token" \
   "$STATE/$ID.kimi-turnend-token" "$STATE/$ID.muse-session" \

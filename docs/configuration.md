@@ -314,44 +314,112 @@ For Pi and pi-signed secondmate launches, `fm-spawn.sh` starts the selected exec
 ## Crew dispatch profiles (config/crew-dispatch.json)
 
 `config/crew-dispatch.json` is an optional local, gitignored file containing natural-language rules that firstmate reads before dispatching a crewmate or scout.
-The shell scripts do not match those rules; firstmate chooses the best matching rule with judgment, resolves its profile object or array under the operating contract in `AGENTS.md` section 4 and `quota-array-dispatch`, and passes only concrete `--harness`, `--model`, and `--effort` flags to `fm-spawn.sh`.
+For schema version 1, the shell scripts do not match those rules; firstmate chooses the best matching rule with judgment, resolves its inline profile object or array under the operating contract in `AGENTS.md` section 4 and `quota-array-dispatch`, and passes concrete `--harness`, `--model`, and `--effort` flags to `fm-spawn.sh`.
 When the file exists, `fm-spawn.sh` enforces that contract by refusing crewmate and scout spawns that lack an explicit harness (`--harness`, a positional adapter, or a raw launch command).
-Batch spawns satisfy the same requirement with a shared `--harness`.
+Version 1 batch spawns satisfy the same requirement with a shared `--harness`.
 Secondmate spawns are exempt and still resolve through `config/secondmate-harness` and its optional model and effort tokens.
 This section is the single owner of the canonical schema and its per-field semantics.
 `AGENTS.md` section 4 owns the always-loaded dispatch intake boundary, and `quota-array-dispatch` owns the completion-aware profile-array selection procedure.
 
+`schemaVersion` may be `1` or `2`; omitting it selects the legacy version 1 format.
+Version 1 keeps the original inline profile objects or arrays described below for compatibility.
+Version 2 names profiles once, applies fixed routing limits, and lets the `automatic-dispatch` procedure select and admit a qualified route.
+
+### Version 2 subscription routing
+
+The copyable [version 2 dispatch example](examples/crew-dispatch.json) is the canonical complete example.
+The documented top-level fields are `schemaVersion`, optional `routing`, optional `profiles`, optional `rules`, and optional `default`.
+`schemaVersion` is exactly `2` for this format.
+
+`routing.mode` is one of `off`, `simulate`, `canary`, or `automatic`, and defaults to `automatic` when omitted.
+`off` and `simulate` never reserve routing capacity; simulation records only a privacy-safe proposed route.
+`canary` admits at most three active workers, and `automatic` admits at most six.
+The burst ceiling is eight and is available only to low-risk decomposable work in automatic mode.
+Every mode also enforces at most two active workers per lane and at most two per non-Pi symbolic account.
+The five effective caps are fixed: `canary=3`, `automatic=6`, `burst=8`, `perLane=2`, and `perAccount=2`.
+The policy validator requires the first four values when `limits` is supplied; `perAccount=2` is an independently enforced runtime cap exposed by `fm-route.sh status` and is included in the complete example for operator visibility.
+The fixed circuit breaker opens a lane after three failures within 900 seconds and cools down after 1,800 seconds.
+`transientRetries` is fixed at one.
+Omitted `limits`, `circuitBreaker`, and `transientRetries` receive their implemented defaults; supplied policy-carried values must match the fixed contract.
+
+`profiles` maps routing identifiers to profile objects; profile, provider, and lane identifiers are at most 128 characters and match `[A-Za-z0-9][A-Za-z0-9._-]*`.
+Each profile requires `harness`, a concrete non-`default` `model`, `provider`, `lane`, `reasoningClass`, and a non-empty `workTypes` array whose values are at most 64 characters and match `[a-z0-9][a-z0-9._-]*`.
+The recognized optional fields are `effort` and `account`; normalized profile output drops every other field.
+Version 2 supports only `claude`, `codex`, `pi`, and `pi-signed` harnesses.
+`reasoningClass` is one of `basic`, `standard`, `strong`, or `maximum`.
+Claude, Pi, and pi-signed accept `low`, `medium`, `high`, `xhigh`, or `max` effort, while Codex accepts `low`, `medium`, `high`, or `xhigh`.
+Version 2 never permits an omitted or `default` model because routed admission must bind one exact launch identity. An omitted effort is the explicit omission sentinel: routing persists JSON `null`, spawn passes no `--effort`, and relaunch must preserve that omission. Version 1 retains its optional model and effort behavior.
+Native Claude and Codex profiles require a lowercase symbolic `account` identifier of at most 128 characters matching `[a-z0-9][a-z0-9-]*`.
+Pi and pi-signed profiles must omit `account`; their normalized routing candidate uses the literal account `none` because Pi provider capacity is represented by `lane`, not a native account store.
+The example uses current intended work types such as `mechanical`, `implementation`, `architecture`, `debugging`, `security`, and `review`; routing requests independently validate their bounded work type.
+
+A selected version 2 launch carries the nine routing fields `generation`, `profile`, `provider`, `lane`, `account`, `class`, `work-type`, `risk`, and `mode` into the existing spawn lifecycle.
+Immediately before a native launch, the symbolic account resolves through this home's declared account map and binds only its allowed harness environment name to the declared readable configuration directory.
+Spawn admission authenticates the exact reserved task generation through a protected capability and revalidates the unchanged active version 2 policy under the routing lock before creating any admission artifact; relaunch preserves that route, and guarded cleanup releases only the matching generation. Legacy active routes without an authoritative binding remain cleanup-compatible but cannot relaunch.
+Guarded routed teardown calls `fm-route.sh cleanup-ready` without asserting a terminal. Under the routing lock, that command validates the exact route and capability and returns only `{"terminal":"completed|failed_safe|escalated|cancelled|superseded"}`: an existing matching terminal outcome wins, otherwise a pending score wins, otherwise the default is `completed`. After worktree return and confirmed endpoint closure, teardown passes that retained value to `cleanup-finalize`; finalization resolves again under lock and refuses a concurrent conflict while retaining task metadata for retry.
+The [`automatic-dispatch` skill](../.agents/skills/automatic-dispatch/SKILL.md) owns selection, reserve-before-spawn ordering, and fallback, while `fm-spawn.sh`, `fm-control.sh`, and `fm-teardown.sh` own the exact capability and lifecycle mechanics.
+
+Each `rules` entry requires a non-empty natural-language `when` and a non-empty `use` array of profile identifiers.
+The optional `default` is a non-empty array of profile identifiers.
+Every referenced identifier must exist in `profiles`.
+Firstmate interprets `when`, checks live catalog and subscription evidence, and resolves the named candidates through `automatic-dispatch`; the shell validator does not infer task intent.
+
+Credential-shaped keys named `apiKey`, `token`, `secret`, `password`, `cookie`, or `authorization` are forbidden anywhere in the policy, including nested objects.
+The policy and every normalized routing artifact must contain routing metadata only, never prompts, source code, credentials, proprietary content, or raw tool output.
+An invalid version 2 policy produces one stable bootstrap diagnostic and returns new work to configured static dispatch without mutating routing optimization state.
+
+### Native account lanes (config/crew-accounts.json)
+
+Native subscription profiles resolve their symbolic `account` through a separate local, gitignored `config/crew-accounts.json` file.
+The copyable [account-lane example](examples/crew-accounts.json) has `version: 1` and an `accounts` object keyed by lowercase account identifiers.
+Every account object has exactly `harness`, `envName`, and absolute `configDir` fields.
+Claude entries require `harness: "claude"` with `envName: "CLAUDE_CONFIG_DIR"`; Codex entries require `harness: "codex"` with `envName: "CODEX_HOME"`.
+Resolution additionally requires the declared directory to exist and be readable.
+
+`crew-accounts.json` is home-local and is never inherited by secondmates because account paths and authentication stores are host-specific.
+Each home must declare only the native accounts actually available there.
+Do not place credential contents, tokens, cookies, passwords, environment values, prompts, source code, proprietary content, or raw tool output in this file.
+The file stores path references only, and its validator rejects extra account fields and credential-shaped keys.
+A native profile whose account is absent from this home is ineligible; routing continues with qualified Pi or other declared profiles before using static fallback.
+
+### Version 1 compatibility
+
+Version 1 rules keep the following shape:
+
 ```json
 {
+  "schemaVersion": 1,
   "rules": [
     {
-      "when": "<natural-language condition describing a kind of task>",
+      "when": "<natural-language task condition>",
       "use": [
-        { "harness": "<adapter>", "model": "<optional model>", "effort": "<low|medium|high|xhigh|max, optional>" }
+        {"harness": "<adapter>", "model": "<optional model>", "effort": "<optional effort>"}
       ],
-      "why": "<optional rationale that helps firstmate choose>"
+      "why": "<optional rationale>"
     }
   ],
   "default": [
-    { "harness": "<adapter>", "model": "<optional model>", "effort": "<optional effort>" }
+    {"harness": "<adapter>", "model": "<optional model>", "effort": "<optional effort>"}
   ]
 }
 ```
 
-Per rule, `when` and `use` are required.
-Both `use` and the optional top-level `default` accept either one profile object or a non-empty array of profile objects.
-The single-object form stays fully backward-compatible, and every profile needs `harness`.
+Per version 1 rule, `when` and `use` are required.
+Both `use` and the optional top-level `default` accept one profile object or a non-empty array of profile objects, and every profile requires `harness`.
 Profile `model` and `effort` fields and rule `why` are optional.
-An omitted model or effort means the selected harness uses its own default for that axis.
-Every profile array is an implicit quota-aware choice resolved through `quota-array-dispatch`.
-If no dispatch rule fits, firstmate resolves `default` through the same object-or-array path before falling back to `config/crew-harness`.
-If a selected profile carries an effort value the chosen harness does not accept, `fm-spawn.sh` records the requested `effort=` in task meta for traceability but omits the launch flag, and bootstrap reports the invalid harness/effort pair as a `CREW_DISPATCH` diagnostic when it is visible in the file.
-See [`docs/examples/crew-dispatch.json`](examples/crew-dispatch.json) for a starting point to copy into local `config/crew-dispatch.json`.
-When the file exists, bootstrap validates it with `jq`.
-Valid files stay silent by default; with `FM_BOOTSTRAP_VERBOSE_FACTS=1`, bootstrap emits `BOOTSTRAP_INFO: crew dispatch active config/crew-dispatch.json`, one `BOOTSTRAP_INFO:` fact per rule, and one fact for the optional default profile set.
-Malformed JSON, an empty or malformed rule/default array, an unverified harness, or an effort value unsupported by that harness is reported as `CREW_DISPATCH: invalid config/crew-dispatch.json - ...`; missing `jq` is reported through the normal `MISSING: jq` install-consent flow.
-While the file remains present, no crewmate or scout spawn may proceed without an explicit resolved harness; malformed configuration must be reported and corrected rather than selected around.
-Secondmate homes inherit this file from the primary, so a secondmate's own crewmates apply the same dispatch profile behavior.
+Every version 1 profile array is an implicit quota-aware choice resolved through `quota-array-dispatch`.
+If no version 1 rule fits, firstmate resolves `default` through the same path before falling back to `config/crew-harness`.
+
+### Validation and activation
+
+Validate a policy with `bin/fm-dispatch-policy.sh validate config/crew-dispatch.json` and a native account map with `bin/fm-account-lane.sh validate config/crew-accounts.json`.
+When the dispatch file exists, bootstrap validates it with `jq` and `fm-spawn.sh` refuses crewmate or scout launches without an explicit resolved harness.
+Valid files stay silent by default; `FM_BOOTSTRAP_VERBOSE_FACTS=1 bin/fm-bootstrap.sh` prints the active rules and default profile set.
+The policy reader reports invalid input as one bounded `invalid dispatch policy: <reason>` line, where `<reason>` is a fixed category such as `malformed-json`, `duplicate-key`, `forbidden-field`, `routing`, `schema`, `selector`, `profile`, or `reference`; it never echoes policy values, parser output, or file paths.
+Bootstrap suppresses the policy reader's output and reports every invalid policy as exactly one `CREW_DISPATCH: invalid config/crew-dispatch.json - invalid dispatch policy` diagnostic.
+An invalid account map is reported as one sanitized `CREW_ACCOUNTS: invalid config/crew-accounts.json - invalid account-lane configuration` diagnostic.
+Secondmate homes inherit `crew-dispatch.json` from the primary, but never inherit `crew-accounts.json`.
+See the [automatic dispatch verification guide](verification/automatic-dispatch.md) for staged activation, recovery, and rollback checks.
 
 ## Toolchain
 
