@@ -766,16 +766,96 @@ test_bound_admission_rejects_published_launch_identity_tamper() {
   pass "admission binds published harness, model, and effort to the reservation"
 }
 
-test_canary_cap_is_atomic_and_duplicate_reserve_is_idempotent() {
-  local job rc successes=0
+test_fixture_policy_lock_rejects_false_success_ownership() {
+  local fakebin real_mkdir real_jq job rc profile_count reservation_count
+  local successes=0 rc_1=unset rc_2=unset
   reset_route_state
-  mkdir -p "$FM_CONFIG_OVERRIDE"
-  jq -n '{schemaVersion:2,routing:{mode:"canary"},profiles:([range(1;5) as $n | {
-    key:("profile-"+($n|tostring)),value:{harness:"pi",model:("model-profile-"+($n|tostring)),
-    provider:("provider-"+($n|tostring)),lane:("lane-"+($n|tostring)),reasoningClass:"strong",workTypes:["implementation"]}
-  }] | from_entries),default:["profile-1","profile-2","profile-3","profile-4"]}' >"$FM_CONFIG_OVERRIDE/crew-dispatch.json"
+  rm -rf "$FM_CONFIG_OVERRIDE" "$LAB/.test-route-evidence" "$LAB/.test-policy.lock"
+  fakebin=$(fm_fakebin "$LAB/fixture-policy-lock")
+  real_mkdir=$(command -v mkdir)
+  real_jq=$(command -v jq)
+  cat >"$fakebin/mkdir" <<'SH'
+#!/usr/bin/env bash
+if [ "$#" -eq 1 ] && [ "$1" = "$FM_TEST_POLICY_LOCK" ]; then
+  if (set -o noclobber; : >"$FM_TEST_POLICY_BARRIER/owner") 2>/dev/null; then
+    "$FM_TEST_REAL_MKDIR" "$1" 2>/dev/null || exit 1
+    : >"$FM_TEST_POLICY_BARRIER/winner"
+    while [ ! -e "$FM_TEST_POLICY_BARRIER/false-success" ]; do :; done
+    exit 0
+  fi
+  while [ ! -d "$1" ]; do :; done
+  # Reproduce the observed uutils boundary: EEXIST is reported as success.
+  : >"$FM_TEST_POLICY_BARRIER/false-success"
+  while [ ! -e "$FM_TEST_POLICY_BARRIER/winner" ]; do :; done
+  exit 0
+fi
+exec "$FM_TEST_REAL_MKDIR" "$@"
+SH
+  cat >"$fakebin/jq" <<'SH'
+#!/usr/bin/env bash
+marker=
+if [ -e "$FM_TEST_POLICY_BARRIER/false-success" ]; then
+  case " $* " in
+    *' --arg model model-profile-1 '*) marker=profile-1 ;;
+    *' --arg model model-profile-2 '*) marker=profile-2 ;;
+  esac
+fi
+if [ -n "$marker" ]; then
+  : >"$FM_TEST_POLICY_BARRIER/$marker"
+  while [ ! -e "$FM_TEST_POLICY_BARRIER/profile-1" ] \
+    || [ ! -e "$FM_TEST_POLICY_BARRIER/profile-2" ]; do :; done
+fi
+exec "$FM_TEST_REAL_JQ" "$@"
+SH
+  chmod +x "$fakebin/mkdir" "$fakebin/jq"
+  mkdir -p "$LAB/fixture-policy-lock/barrier"
+
+  for job in 1 2; do
+    (
+      export PATH="$fakebin:$PATH"
+      export FM_TEST_POLICY_LOCK="$LAB/.test-policy.lock"
+      export FM_TEST_POLICY_BARRIER="$LAB/fixture-policy-lock/barrier"
+      export FM_TEST_REAL_MKDIR="$real_mkdir"
+      export FM_TEST_REAL_JQ="$real_jq"
+      reserve_route "fixture-$job" "gen-$job" "profile-$job" "provider-$job" \
+        "lane-$job" none decomposable low automatic
+    ) >"$LAB/fixture-reserve-$job.out" 2>&1 &
+    eval "pid_$job=$!"
+  done
+  for job in 1 2; do
+    set +e
+    eval "wait \$pid_$job"
+    rc=$?
+    set -e
+    eval "rc_$job=$rc"
+    [ "$rc" -ne 0 ] || successes=$((successes + 1))
+  done
+  profile_count=$(jq -r '.profiles | length' "$FM_CONFIG_OVERRIDE/crew-dispatch.json" 2>/dev/null || printf 0)
+  reservation_count=$(find "$FM_STATE_OVERRIDE/routing/reservations" -type f -name '*.json' 2>/dev/null | wc -l | tr -d ' ')
+  if [ "$successes" -ne 2 ] || [ "$profile_count" -ne 2 ] || [ "$reservation_count" -ne 2 ]; then
+    fail "fixture policy lock lost ownership: rc1=$rc_1 rc2=$rc_2 profiles=$profile_count reservations=$reservation_count"$'\n'\
+"--- reserve 1 ---"$'\n'"$(cat "$LAB/fixture-reserve-1.out")"$'\n'\
+"--- reserve 2 ---"$'\n'"$(cat "$LAB/fixture-reserve-2.out")"
+  fi
+  pass "fixture policy lock verifies ownership after a false-success mkdir"
+}
+
+test_canary_cap_is_atomic_and_duplicate_reserve_is_idempotent() {
+  local job rc output persisted_count diagnostics contract_ok=1
+  local successes=0 successful_json=0 cap_refusals=0
+  # shellcheck disable=SC2034 # Read through the dynamic worker index below.
+  local rc_1=unset rc_2=unset rc_3=unset rc_4=unset
+  reset_route_state
   for job in 1 2 3 4; do
-    reserve_route "task-$job" "gen-$job" "profile-$job" "provider-$job" "lane-$job" none decomposable low canary >"$LAB/reserve-$job.out" 2>&1 &
+    fm_test_prepare_bound "$ROOT" "$LAB" "$FM_STATE_OVERRIDE" "task-$job" "gen-$job" \
+      "profile-$job" "provider-$job" "lane-$job" none decomposable implementation low canary \
+      pi "model-profile-$job" none 1000 \
+      || fail "canary evidence preparation failed for task-$job"
+  done
+  for job in 1 2 3 4; do
+    fm_test_reserve_prepared_bound "$ROOT" "$LAB" "$FM_STATE_OVERRIDE" "task-$job" "gen-$job" \
+      "profile-$job" "provider-$job" "lane-$job" none decomposable implementation low canary \
+      pi "model-profile-$job" none 1000 >"$LAB/reserve-$job.out" 2>&1 &
     eval "pid_$job=$!"
   done
   for job in 1 2 3 4; do
@@ -783,10 +863,34 @@ test_canary_cap_is_atomic_and_duplicate_reserve_is_idempotent() {
     eval "wait \$pid_$job"
     rc=$?
     set -e
-    [ "$rc" -ne 0 ] || successes=$((successes + 1))
+    eval "rc_$job=$rc"
   done
-  [ "$successes" -eq 3 ] || fail "atomic canary cap admitted $successes workers"
-  [ "$(find "$FM_STATE_OVERRIDE/routing/reservations" -type f -name '*.json' | wc -l)" -eq 3 ] || fail "canary cap persisted the wrong active total"
+  persisted_count=$(find "$FM_STATE_OVERRIDE/routing/reservations" -type f -name '*.json' 2>/dev/null | wc -l | tr -d ' ')
+  diagnostics="persisted=$persisted_count"
+  for job in 1 2 3 4; do
+    eval "rc=\$rc_$job"
+    output=$(cat "$LAB/reserve-$job.out")
+    diagnostics="$diagnostics"$'\n'"rc$job=$rc"$'\n'"--- reserve $job ---"$'\n'"$output"
+    if [ "$rc" -eq 0 ]; then
+      successes=$((successes + 1))
+      if jq -e --arg task "task-$job" --arg generation "gen-$job" \
+        '.taskId == $task and .generation == $generation and .admissionState == "reserved"' \
+        "$LAB/reserve-$job.out" >/dev/null 2>&1; then
+        successful_json=$((successful_json + 1))
+      else
+        contract_ok=0
+      fi
+    elif [ "$output" = 'fm-route: global-cap:3' ]; then
+      cap_refusals=$((cap_refusals + 1))
+    else
+      contract_ok=0
+    fi
+  done
+  if [ "$contract_ok" -ne 1 ] || [ "$successes" -ne 3 ] \
+    || [ "$successful_json" -ne 3 ] || [ "$cap_refusals" -ne 1 ] \
+    || [ "$persisted_count" -ne 3 ]; then
+    fail "atomic canary contract mismatch: successes=$successes valid_json=$successful_json cap_refusals=$cap_refusals"$'\n'"$diagnostics"
+  fi
 
   reset_route_state
   reserve_route task-1 gen-1 profile-1 provider-1 lane-1 none standard low automatic >/dev/null || fail "initial reservation failed"
@@ -1843,6 +1947,7 @@ test_reserve_rejects_a_decision_staled_by_authoritative_load
 test_legacy_unbound_reservations_are_cleanup_only
 test_begin_admission_revalidates_the_active_policy_before_mutation
 test_bound_admission_rejects_published_launch_identity_tamper
+test_fixture_policy_lock_rejects_false_success_ownership
 test_canary_cap_is_atomic_and_duplicate_reserve_is_idempotent
 test_lane_account_and_burst_caps_are_enforced
 test_reservation_verification_and_generation_release_are_exact

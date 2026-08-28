@@ -305,17 +305,43 @@ assert_present() {
   [ -e "$1" ] || fail "$2"
 }
 
+# The fixture policy lock uses bash's noclobber open as its exclusive claim and
+# verifies the exact token before entering or leaving the critical section.
+# This avoids trusting an external mkdir implementation's exit status.
+fm_test_policy_lock_acquire() {
+  local lock=$1 token current
+  FM_TEST_POLICY_LOCK_OWNER=
+  token="${BASHPID:-$$}.$RANDOM"
+  while :; do
+    if (set -o noclobber; printf '%s\n' "$token" >"$lock") 2>/dev/null; then
+      current=$(cat "$lock" 2>/dev/null || true)
+      if [ -f "$lock" ] && [ ! -L "$lock" ] && [ "$current" = "$token" ]; then
+        FM_TEST_POLICY_LOCK_OWNER=$token
+        return 0
+      fi
+    fi
+  done
+}
+
+fm_test_policy_lock_release() {
+  local lock=$1 owner=$2 current
+  [ -f "$lock" ] && [ ! -L "$lock" ] || return 1
+  current=$(cat "$lock" 2>/dev/null || true)
+  [ "$current" = "$owner" ] || return 1
+  rm -f -- "$lock"
+}
+
 # Build the same policy/request/candidate/decision evidence a routed caller must
-# produce, then reserve the exact selected tuple. Test-only serialization keeps
-# concurrent cap tests from racing their shared policy fixture.
-fm_test_reserve_bound() {
+# produce. Test-only serialization keeps shared policy fixture updates exact.
+fm_test_prepare_bound() {
   local root=$1 home=$2 state=$3 task=$4 generation=$5 profile=$6 provider=$7 lane=$8 account=$9
   local task_class=${10} work_type=${11} risk=${12} mode=${13} harness=${14} model=${15} effort=${16} now=${17}
   shift 17
   local config="$home/config/crew-dispatch.json" evidence="$home/.test-route-evidence/$task-$generation-$profile-$provider-$lane-$account-$task_class-$work_type-$risk-$mode" lock="$home/.test-policy.lock"
-  local policy_tmp profile_json
+  local lock_owner policy_tmp profile_json
   mkdir -p "$home/config" "$evidence"
-  while ! mkdir "$lock" 2>/dev/null; do :; done
+  fm_test_policy_lock_acquire "$lock" || return 1
+  lock_owner=$FM_TEST_POLICY_LOCK_OWNER
   if [ -s "$config" ] && jq -e '.schemaVersion == 2' "$config" >/dev/null 2>&1; then
     profile_json=$(jq -cn --arg harness "$harness" --arg model "$model" --arg provider "$provider" \
       --arg lane "$lane" --arg account "$account" --arg workType "$work_type" --arg effort "$effort" '
@@ -338,7 +364,7 @@ fm_test_reserve_bound() {
     jq -n --arg mode "$mode" --arg profile "$profile" --argjson value "$profile_json" \
       '{schemaVersion:2,routing:{mode:$mode},profiles:{($profile):$value},default:[$profile]}' >"$config"
   fi
-  rmdir "$lock"
+  fm_test_policy_lock_release "$lock" "$lock_owner" || return 1
   if [ ! -s "$evidence/decision.json" ]; then
     jq -n --arg task "$task" --arg class "$task_class" --arg workType "$work_type" --arg risk "$risk" \
       '{taskId:$task,taskClass:$class,workType:$workType,risk:$risk,independent:false,requestedWorkers:1,requiredReasoningClass:"strong",estimatedSeconds:60}' >"$evidence/request.json"
@@ -348,11 +374,27 @@ fm_test_reserve_bound() {
     FM_HOME="$home" FM_STATE_OVERRIDE="$state" "$root/bin/fm-route.sh" select \
       --request "$evidence/request.json" --candidates "$evidence/candidates.json" --now "$now" >"$evidence/decision.json" || return 1
   fi
+}
+
+# Reserve an exact tuple whose request, candidate, and decision evidence was
+# already prepared. This helper performs no shared fixture preparation.
+fm_test_reserve_prepared_bound() {
+  local root=$1 home=$2 state=$3 task=$4 generation=$5 profile=$6 provider=$7 lane=$8 account=$9
+  local task_class=${10} work_type=${11} risk=${12} mode=${13} now=${17}
+  shift 17
+  local evidence="$home/.test-route-evidence/$task-$generation-$profile-$provider-$lane-$account-$task_class-$work_type-$risk-$mode"
   FM_HOME="$home" FM_STATE_OVERRIDE="$state" "$root/bin/fm-route.sh" reserve \
     --task "$task" --generation "$generation" --profile "$profile" --provider "$provider" --lane "$lane" \
     --account "$account" --class "$task_class" --work-type "$work_type" --risk "$risk" --mode "$mode" \
     --request "$evidence/request.json" --candidates "$evidence/candidates.json" --decision "$evidence/decision.json" \
     --now "$now" "$@"
+}
+
+# Prepare and reserve the exact selected tuple for callers that do not need to
+# isolate reservation concurrency from fixture preparation.
+fm_test_reserve_bound() {
+  fm_test_prepare_bound "$@" || return 1
+  fm_test_reserve_prepared_bound "$@"
 }
 # fm_test_path_without <dir> <name...>: build a private PATH directory that
 # exposes the host's ordinary executables except for explicitly absent tools.
