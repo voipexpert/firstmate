@@ -14,18 +14,30 @@ function runProcess(command, args, input = "") {
     });
     let stdout = "";
     let stderr = "";
+    let stdinFailure = "";
     child.stdout.on("data", (chunk) => {
       stdout += chunk.toString();
     });
     child.stderr.on("data", (chunk) => {
       stderr += chunk.toString();
     });
-    child.stdin.on("error", () => {
-      // The child exit status and captured output own the result. A fast child
-      // may close stdin before this small hook payload is fully written.
+    const onStdinError = (error) => {
+      if (error?.code === "EPIPE") return;
+      const candidate = typeof error?.code === "string" ? error.code : "UNKNOWN";
+      const errorCode = /^[A-Z0-9_]{1,32}$/.test(candidate) ? candidate : "UNKNOWN";
+      stdinFailure ||= `child stdin failed (${errorCode})`;
+    };
+    child.stdin.on("error", onStdinError);
+    child.once("error", () => resolve({ code: 0, stdout: "", stderr: "" }));
+    child.once("close", (code) => {
+      child.stdin.removeListener("error", onStdinError);
+      if (stdinFailure) {
+        const separator = stderr && !stderr.endsWith("\n") ? "\n" : "";
+        resolve({ code: 1, stdout, stderr: `${stderr}${separator}${stdinFailure}\n` });
+        return;
+      }
+      resolve({ code: code ?? 0, stdout, stderr });
     });
-    child.on("error", () => resolve({ code: 0, stdout: "", stderr: "" }));
-    child.on("close", (code) => resolve({ code: code ?? 0, stdout, stderr }));
     child.stdin.end(input);
   });
 }

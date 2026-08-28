@@ -2790,6 +2790,71 @@ EOF
   pass "OpenCode turn-end guard survives child stdin EPIPE"
 }
 
+test_opencode_turnend_guard_rejects_non_epipe_stdin_error() {
+  local guard_plugin repo home out status
+  guard_plugin="$ROOT/.opencode/plugins/fm-primary-turnend-guard.js"
+  repo="$TMP_ROOT/opencode-guard-stdin-eacces-root"
+  home="$TMP_ROOT/opencode-guard-stdin-eacces-home"
+  mkdir -p "$repo/bin" "$home/state"
+  git init -q "$repo"
+  cat > "$repo/bin/fm-turnend-guard.sh" <<'SH'
+#!/usr/bin/env bash
+cat >/dev/null
+printf 'guard completed after an injected stdin EACCES\n' >&2
+exit 2
+SH
+  chmod +x "$repo/bin/fm-turnend-guard.sh"
+  out=$(GUARD_PLUGIN="$guard_plugin" WORKTREE="$repo" FM_HOME="$home" node 2>&1 <<'EOF'
+import childProcess from "node:child_process";
+import { syncBuiltinESMExports } from "node:module";
+import { pathToFileURL } from "node:url";
+
+const originalSpawn = childProcess.spawn;
+const injectedErrorCodes = [];
+childProcess.spawn = (command, args, options) => {
+  const child = originalSpawn(command, args, options);
+  if (String(command).endsWith("/bin/fm-turnend-guard.sh")) {
+    queueMicrotask(() => {
+      for (const [code, errno] of [["EPIPE", -32], ["EACCES", -13]]) {
+        injectedErrorCodes.push(code);
+        const error = Object.assign(new Error(`write ${code}`), { code, errno, syscall: "write" });
+        child.stdin.emit("error", error);
+      }
+    });
+  }
+  return child;
+};
+syncBuiltinESMExports();
+
+const guardMod = await import(pathToFileURL(process.env.GUARD_PLUGIN).href);
+const promptBodies = [];
+const client = {
+  session: {
+    promptAsync: async (request) => {
+      promptBodies.push(request.body.parts[0].text);
+    },
+  },
+};
+const guardHooks = await guardMod.FmPrimaryTurnendGuard({
+  client,
+  directory: process.env.WORKTREE,
+  worktree: process.env.WORKTREE,
+});
+await guardHooks.event({ event: { type: "session.idle", properties: { sessionID: "session-test" } } });
+if (injectedErrorCodes.join(",") !== "EPIPE,EACCES") {
+  throw new Error(`unexpected injected stdin error sequence: ${injectedErrorCodes.join(",")}`);
+}
+if (promptBodies.length !== 0) {
+  throw new Error(`non-EPIPE stdin failure was silently accepted (${promptBodies.length} prompt)`);
+}
+EOF
+)
+  status=$?
+  expect_code 0 "$status" "OpenCode turn-end guard must reject non-EPIPE child stdin errors: $out"
+  [ -z "$out" ] || fail "OpenCode turn-end guard non-EPIPE test printed output: $out"
+  pass "OpenCode turn-end guard rejects non-EPIPE child stdin errors"
+}
+
 test_opencode_healthy_arm_output_does_not_suppress_guard() {
   local arm_plugin guard_plugin repo home log guard_log guard_input_log out status
   arm_plugin="$ROOT/.opencode/plugins/fm-primary-watch-arm.js"
@@ -2828,6 +2893,7 @@ SH
   out=$(ARM_PLUGIN="$arm_plugin" GUARD_PLUGIN="$guard_plugin" WORKTREE="$repo" FM_HOME="$home" FM_ARM_LOG="$log" FM_GUARD_LOG="$guard_log" FM_GUARD_INPUT_LOG="$guard_input_log" \
     FM_TEST_ARM_CLOSE_RELEASE_FILE="${FM_TEST_ARM_CLOSE_RELEASE_FILE:-}" \
     FM_TEST_WAIT_FOR_WATCHER_PROMPT="${FM_TEST_WAIT_FOR_WATCHER_PROMPT:-}" \
+    FM_TEST_EXTRA_PROMPT_KIND="${FM_TEST_EXTRA_PROMPT_KIND:-}" \
     FM_WATCH_REARM_RETRY_BASE_MS="${FM_WATCH_REARM_RETRY_BASE_MS:-}" \
     FM_WATCH_REARM_RETRY_MAX_MS="${FM_WATCH_REARM_RETRY_MAX_MS:-}" \
     FM_WATCH_REARM_RETRY_LIMIT="${FM_WATCH_REARM_RETRY_LIMIT:-}" \
@@ -2849,6 +2915,17 @@ const waitForWatcherPrompt = () => new Promise((resolve, reject) => {
     resolve();
   });
 });
+const classifyPrompt = (text) => {
+  const blind = text.includes("TURN WOULD END BLIND");
+  const watcherFailure = text.includes("WATCHER FIRED") &&
+    text.includes("watcher: FAILED - OpenCode");
+  if (blind === watcherFailure) return "unrelated";
+  return blind ? "blind" : "watcherFailure";
+};
+const promptClassCounts = () => promptBodies.reduce((counts, text) => {
+  counts[classifyPrompt(text)] += 1;
+  return counts;
+}, { blind: 0, watcherFailure: 0, unrelated: 0 });
 const client = {
   session: {
     promptAsync: async (request) => {
@@ -2880,6 +2957,7 @@ const diagnosticSnapshot = () => JSON.stringify({
   prompt: {
     count: promptBodies.length,
     bytes: promptBodies.reduce((total, text) => total + Buffer.byteLength(text), 0),
+    classes: promptClassCounts(),
     blind: promptBodies.some((text) => text.includes("TURN WOULD END BLIND")),
     latestBlind: (promptBodies.at(-1) ?? "").includes("TURN WOULD END BLIND"),
   },
@@ -2898,6 +2976,12 @@ writeFileSync(`${process.env.FM_HOME}/state/.lock`, `${process.pid}\n`);
 await guardHooks.event({ event: { type: "session.idle", properties: { sessionID: "session-test" } } });
 for (let i = 0; i < 250 && !existsSync(process.env.FM_GUARD_LOG); i += 1) {
   await new Promise((resolve) => setTimeout(resolve, 20));
+}
+if (process.env.FM_TEST_EXTRA_PROMPT_KIND === "duplicate-blind") {
+  const blindPrompt = promptBodies.find((text) => text.includes("TURN WOULD END BLIND"));
+  promptBodies.push(blindPrompt ?? "TURN WOULD END BLIND");
+} else if (process.env.FM_TEST_EXTRA_PROMPT_KIND === "unrelated") {
+  promptBodies.push("test-only unrelated prompt");
 }
 try {
   if (process.env.FM_TEST_FORCE_OPENCODE_EMBEDDED_FAILURE === "1") {
@@ -2921,8 +3005,11 @@ try {
   if (!promptBodies.some((text) => text.includes("TURN WOULD END BLIND"))) {
     throw new Error("missing blind-turn prompt");
   }
-  if (process.env.FM_TEST_WAIT_FOR_WATCHER_PROMPT === "1" && promptBodies.length < 2) {
-    throw new Error("concurrent watcher prompt perturbation did not occur");
+  if (process.env.FM_TEST_WAIT_FOR_WATCHER_PROMPT === "1") {
+    const classes = promptClassCounts();
+    if (promptBodies.length !== 2 || classes.blind !== 1 || classes.watcherFailure !== 1 || classes.unrelated !== 0) {
+      throw new Error("unexpected concurrent prompt cardinality");
+    }
   }
 } catch (error) {
   console.error(`embedded assertion: ${String(error?.message ?? error)}`);
@@ -2967,6 +3054,25 @@ test_opencode_concurrent_failure_prompt_does_not_mask_guard_delivery() {
   pass "OpenCode concurrent failure prompt does not mask guard delivery"
 }
 
+test_opencode_concurrent_prompt_cardinality_rejects_extra_prompts() {
+  local kind case_root out status
+  for kind in duplicate-blind unrelated; do
+    case_root="$TMP_ROOT/opencode-concurrent-prompt-$kind"
+    out=$(TMP_ROOT="$case_root" \
+      FM_TEST_ARM_CLOSE_RELEASE_FILE="$case_root/arm-close.release" \
+      FM_TEST_WAIT_FOR_WATCHER_PROMPT=1 \
+      FM_TEST_EXTRA_PROMPT_KIND="$kind" \
+      FM_WATCH_REARM_RETRY_BASE_MS=5 \
+      FM_WATCH_REARM_RETRY_MAX_MS=5 \
+      FM_WATCH_REARM_RETRY_LIMIT=1 \
+      test_opencode_healthy_arm_output_does_not_suppress_guard 2>&1)
+    status=$?
+    expect_code 1 "$status" "OpenCode concurrent prompt cardinality must reject $kind: $out"
+    assert_contains "$out" "unexpected concurrent prompt cardinality" "OpenCode $kind counterfactual must fail at prompt classification"
+  done
+  pass "OpenCode concurrent prompt cardinality rejects duplicates and unrelated prompts"
+}
+
 test_pi_extension_reports_external_healthy_watcher
 test_pi_tool_returns_agent_tool_result
 test_pi_redundant_tool_call_is_owned_noop
@@ -3004,6 +3110,8 @@ test_opencode_established_empty_close_honors_retry_limit
 test_opencode_actionable_close_rechecks_session_lock
 test_opencode_watch_arm_coordinates_with_turnend_guard
 test_opencode_turnend_guard_survives_stdin_epipe
+test_opencode_turnend_guard_rejects_non_epipe_stdin_error
 test_opencode_healthy_arm_output_does_not_suppress_guard
 test_opencode_embedded_failure_surfaces_bounded_snapshot
 test_opencode_concurrent_failure_prompt_does_not_mask_guard_delivery
+test_opencode_concurrent_prompt_cardinality_rejects_extra_prompts
