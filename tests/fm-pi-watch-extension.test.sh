@@ -2893,6 +2893,7 @@ SH
   out=$(ARM_PLUGIN="$arm_plugin" GUARD_PLUGIN="$guard_plugin" WORKTREE="$repo" FM_HOME="$home" FM_ARM_LOG="$log" FM_GUARD_LOG="$guard_log" FM_GUARD_INPUT_LOG="$guard_input_log" \
     FM_TEST_ARM_CLOSE_RELEASE_FILE="${FM_TEST_ARM_CLOSE_RELEASE_FILE:-}" \
     FM_TEST_WAIT_FOR_WATCHER_PROMPT="${FM_TEST_WAIT_FOR_WATCHER_PROMPT:-}" \
+    FM_TEST_VERIFY_NEW_FAILURE_INCIDENT="${FM_TEST_VERIFY_NEW_FAILURE_INCIDENT:-}" \
     FM_TEST_EXTRA_PROMPT_KIND="${FM_TEST_EXTRA_PROMPT_KIND:-}" \
     FM_WATCH_REARM_RETRY_BASE_MS="${FM_WATCH_REARM_RETRY_BASE_MS:-}" \
     FM_WATCH_REARM_RETRY_MAX_MS="${FM_WATCH_REARM_RETRY_MAX_MS:-}" \
@@ -2904,17 +2905,31 @@ import { pathToFileURL } from "node:url";
 const armMod = await import(pathToFileURL(process.env.ARM_PLUGIN).href);
 const guardMod = await import(pathToFileURL(process.env.GUARD_PLUGIN).href);
 const promptBodies = [];
-let resolveWatcherPrompt;
-const watcherPromptObserved = new Promise((resolve) => {
-  resolveWatcherPrompt = resolve;
-});
-const waitForWatcherPrompt = () => new Promise((resolve, reject) => {
-  const timer = setTimeout(() => reject(new Error("concurrent watcher prompt did not arrive")), 2000);
-  watcherPromptObserved.then(() => {
-    clearTimeout(timer);
-    resolve();
+let settledRetryIncidents = 0;
+const retryIncidentWaiters = [];
+const markRetryIncidentSettled = () => {
+  settledRetryIncidents += 1;
+  for (const waiter of retryIncidentWaiters.splice(0)) waiter();
+};
+const waitForRetryIncidentCount = (expected) => {
+  if (settledRetryIncidents >= expected) return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    const onProgress = () => {
+      if (settledRetryIncidents < expected) {
+        retryIncidentWaiters.push(onProgress);
+        return;
+      }
+      clearTimeout(timer);
+      resolve();
+    };
+    const timer = setTimeout(() => {
+      const index = retryIncidentWaiters.indexOf(onProgress);
+      if (index >= 0) retryIncidentWaiters.splice(index, 1);
+      reject(new Error(`retry lifecycle did not settle at incident ${expected}`));
+    }, 2000);
+    retryIncidentWaiters.push(onProgress);
   });
-});
+};
 const classifyPrompt = (text) => {
   const blind = text.includes("TURN WOULD END BLIND");
   const watcherFailure = text.includes("WATCHER FIRED") &&
@@ -2931,11 +2946,12 @@ const client = {
     promptAsync: async (request) => {
       const text = request.body.parts[0].text;
       promptBodies.push(text);
-      if (!text.includes("TURN WOULD END BLIND")) {
-        resolveWatcherPrompt();
-      } else if (process.env.FM_TEST_WAIT_FOR_WATCHER_PROMPT === "1") {
+      if (text.includes("could not restore watcher continuity after 1 retries")) {
+        markRetryIncidentSettled();
+      }
+      if (text.includes("TURN WOULD END BLIND") && process.env.FM_TEST_WAIT_FOR_WATCHER_PROMPT === "1") {
         writeFileSync(process.env.FM_TEST_ARM_CLOSE_RELEASE_FILE, "release\n");
-        await waitForWatcherPrompt();
+        await waitForRetryIncidentCount(1);
       }
     },
   },
@@ -2983,6 +2999,8 @@ if (process.env.FM_TEST_EXTRA_PROMPT_KIND === "duplicate-blind") {
 } else if (process.env.FM_TEST_EXTRA_PROMPT_KIND === "unrelated") {
   promptBodies.push("test-only unrelated prompt");
 }
+const firstIncidentPromptCount = promptBodies.length;
+const firstIncidentClasses = promptClassCounts();
 try {
   if (process.env.FM_TEST_FORCE_OPENCODE_EMBEDDED_FAILURE === "1") {
     throw new Error("forced embedded assertion");
@@ -3006,9 +3024,20 @@ try {
     throw new Error("missing blind-turn prompt");
   }
   if (process.env.FM_TEST_WAIT_FOR_WATCHER_PROMPT === "1") {
-    const classes = promptClassCounts();
-    if (promptBodies.length !== 2 || classes.blind !== 1 || classes.watcherFailure !== 1 || classes.unrelated !== 0) {
+    if (firstIncidentPromptCount !== 2 || firstIncidentClasses.blind !== 1 || firstIncidentClasses.watcherFailure !== 1 || firstIncidentClasses.unrelated !== 0) {
       throw new Error("unexpected concurrent prompt cardinality");
+    }
+  }
+  if (process.env.FM_TEST_VERIFY_NEW_FAILURE_INCIDENT === "1") {
+    const secondIncidentSettled = waitForRetryIncidentCount(2);
+    const status = await globalThis.__firstmateOpenCodeWatchArm.ensureArmed("session-test", client);
+    if (status !== "external") {
+      throw new Error(`new failure incident did not reach the external-watcher boundary (${status})`);
+    }
+    await secondIncidentSettled;
+    const classes = promptClassCounts();
+    if (promptBodies.length !== 3 || classes.blind !== 1 || classes.watcherFailure !== 2 || classes.unrelated !== 0) {
+      throw new Error("new failure incident did not notify exactly once");
     }
   }
 } catch (error) {
@@ -3045,6 +3074,7 @@ test_opencode_concurrent_failure_prompt_does_not_mask_guard_delivery() {
   out=$(TMP_ROOT="$case_root" \
     FM_TEST_ARM_CLOSE_RELEASE_FILE="$case_root/arm-close.release" \
     FM_TEST_WAIT_FOR_WATCHER_PROMPT=1 \
+    FM_TEST_VERIFY_NEW_FAILURE_INCIDENT=1 \
     FM_WATCH_REARM_RETRY_BASE_MS=5 \
     FM_WATCH_REARM_RETRY_MAX_MS=5 \
     FM_WATCH_REARM_RETRY_LIMIT=1 \

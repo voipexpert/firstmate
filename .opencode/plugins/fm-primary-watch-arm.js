@@ -23,6 +23,8 @@ let restorationInFlight = null;
 let armClose = new WeakMap();
 let armReadiness = new WeakMap();
 let armRecovery = new WeakMap();
+let armFailureIncident = new WeakMap();
+let notifiedFailureIncidents = new WeakSet();
 
 function positiveInteger(name, fallback) {
   const value = Number(process.env[name]);
@@ -248,7 +250,11 @@ function wakePrompt(reason) {
   return `WATCHER FIRED - drain queued wakes with bin/fm-wake-drain.sh and handle the reported wake. Watcher continuity is plugin-owned.\n\n${reason}`;
 }
 
-function surfaceFailure(paths, client, sessionID, reason) {
+function surfaceFailure(paths, client, sessionID, reason, failureIncident = null) {
+  if (failureIncident) {
+    if (notifiedFailureIncidents.has(failureIncident)) return;
+    notifiedFailureIncidents.add(failureIncident);
+  }
   void sendPrompt(paths, client, sessionID, wakePrompt(reason)).catch(() => {
     // OpenCode owns delivery errors; continuity restoration never waits on prompting.
   });
@@ -308,32 +314,34 @@ async function restoreAfterActionableClose(paths, sessionID, client, predecessor
   return { failure: `${failure}\nwatcher: FAILED - OpenCode could not restore watcher continuity after ${REARM_RETRY_LIMIT} retries` };
 }
 
-async function scheduleRetry(paths, sessionID, client, reason, predecessorArmPid) {
+async function scheduleRetry(paths, sessionID, client, reason, predecessorArmPid, failureIncident = null) {
   if (child || retryTimer) return;
+  const activeFailureIncident = failureIncident ?? {};
   if (!(await sessionOwnsLock(paths))) {
     setArmStatus("failed");
-    surfaceFailure(paths, client, sessionID, `watcher: FAILED - OpenCode cannot restore continuity because this session no longer owns the lock\n${reason}`);
+    surfaceFailure(paths, client, sessionID, `watcher: FAILED - OpenCode cannot restore continuity because this session no longer owns the lock\n${reason}`, activeFailureIncident);
     return;
   }
   retryFailures += 1;
   if (retryFailures > REARM_RETRY_LIMIT) {
     setArmStatus("failed");
-    surfaceFailure(paths, client, sessionID, `watcher: FAILED - OpenCode could not restore watcher continuity after ${REARM_RETRY_LIMIT} retries\n${reason}`);
+    surfaceFailure(paths, client, sessionID, `watcher: FAILED - OpenCode could not restore watcher continuity after ${REARM_RETRY_LIMIT} retries\n${reason}`, activeFailureIncident);
     return;
   }
   setArmStatus("retrying");
   const timer = setTimeout(() => {
     if (retryTimer === timer) retryTimer = null;
-    void ensureArm(paths, sessionID, client, predecessorArmPid).then((status) => {
+    void ensureArm(paths, sessionID, client, predecessorArmPid, true, activeFailureIncident).then(async ({ status, armChild }) => {
       if (["armed", "starting", "wake"].includes(status)) return;
-      surfaceFailure(paths, client, sessionID, `watcher: FAILED - OpenCode could not launch a continuity retry (${status})`);
+      if (armChild && await retireArm(armChild)) return;
+      surfaceFailure(paths, client, sessionID, `watcher: FAILED - OpenCode could not launch a continuity retry (${status})`, activeFailureIncident);
     });
   }, retryDelay(retryFailures));
   timer.unref();
   retryTimer = timer;
 }
 
-function spawnArm(paths, sessionID, client, predecessorArmPid = "") {
+function spawnArm(paths, sessionID, client, predecessorArmPid = "", failureIncident = null) {
   setArmStatus("starting");
   const env = {
     ...process.env,
@@ -348,6 +356,7 @@ function spawnArm(paths, sessionID, client, predecessorArmPid = "") {
     stdio: ["ignore", "pipe", "pipe"],
   });
   child = armChild;
+  if (failureIncident) armFailureIncident.set(armChild, failureIncident);
   let stdout = "";
   let stderr = "";
   let settled = false;
@@ -420,7 +429,7 @@ function spawnArm(paths, sessionID, client, predecessorArmPid = "") {
       setArmStatus("failed");
       return;
     }
-    void scheduleRetry(paths, sessionID, client, classification.message, predecessor);
+    void scheduleRetry(paths, sessionID, client, classification.message, predecessor, armFailureIncident.get(armChild));
   });
   armChild.on("error", (error) => {
     if (settled) return;
@@ -438,29 +447,30 @@ function spawnArm(paths, sessionID, client, predecessorArmPid = "") {
       client,
       `watcher: FAILED - OpenCode arm child failed: ${error.message}`,
       String(armChild.pid ?? ""),
+      armFailureIncident.get(armChild),
     );
   });
   return armChild;
 }
 
-async function beginArm(paths, sessionID, client, predecessorArmPid) {
+async function beginArm(paths, sessionID, client, predecessorArmPid, failureIncident) {
   if (!sessionID) return { status: "skipped", armChild: null };
   if (!(await isPrimaryRoot(paths.root, paths.home))) return { status: "not-primary", armChild: null };
   if (!(await sessionOwnsLock(paths))) return { status: "read-only", armChild: null };
   if (child) return { status: "existing", armChild: child };
   if (retryTimer) return { status: "retrying", armChild: null };
   if (!shouldArm(paths)) return { status: "not-needed", armChild: null };
-  return { status: "spawned", armChild: spawnArm(paths, sessionID, client, predecessorArmPid) };
+  return { status: "spawned", armChild: spawnArm(paths, sessionID, client, predecessorArmPid, failureIncident) };
 }
 
 function armAttempt(status, armChild, includeArmChild) {
   return includeArmChild ? { status, armChild } : status;
 }
 
-async function ensureArm(paths, sessionID, client, predecessorArmPid = "", includeArmChild = false) {
+async function ensureArm(paths, sessionID, client, predecessorArmPid = "", includeArmChild = false, failureIncident = null) {
   let launchResult = null;
   if (!launchInFlight) {
-    const launch = beginArm(paths, sessionID, client, predecessorArmPid);
+    const launch = beginArm(paths, sessionID, client, predecessorArmPid, failureIncident);
     launchInFlight = launch;
     try {
       launchResult = await launch;
@@ -471,6 +481,9 @@ async function ensureArm(paths, sessionID, client, predecessorArmPid = "", inclu
     launchResult = await launchInFlight;
   }
   const armChild = launchResult.armChild;
+  if (failureIncident && armChild && !armFailureIncident.has(armChild)) {
+    armFailureIncident.set(armChild, failureIncident);
+  }
   if (!armChild) {
     return armAttempt(launchResult.status, null, includeArmChild);
   }
