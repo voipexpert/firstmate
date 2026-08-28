@@ -1046,7 +1046,7 @@ test_arm_portable_ps_snapshot_cleans_child() {
 
 test_arm_preconfirmation_signal_reaps_exact_spawned_child() (
   local dir state fakebin armout armerr ready release claim exec_ready exec_release stable_ready
-  local cygwin_ps_log proc_stat_log
+  local production_ps_log fixture_ps_log proc_stat_log
   local real_bash real_cat real_od real_ps real_sleep launch_cmdline_hex stable_identity stable_cmdline_hex
   local armpid arm_identity child_pid child_parent child_identity od_pid status i
   local child_survived=0 od_survived=0 sentinel_pid sentinel_identity sentinel_untouched=0
@@ -1063,7 +1063,8 @@ test_arm_preconfirmation_signal_reaps_exact_spawned_child() (
   exec_ready="$dir/watcher-pre-exec.ready"
   exec_release="$dir/watcher-pre-exec.release"
   stable_ready="$dir/watcher-post-exec.ready"
-  cygwin_ps_log="$dir/cygwin-ps.log"
+  production_ps_log="$dir/cygwin-production-ps.log"
+  fixture_ps_log="$dir/cygwin-fixture-ps.log"
   proc_stat_log="$dir/proc-stat.log"
   real_bash=$(command -v bash)
   real_cat=$(command -v cat)
@@ -1141,11 +1142,11 @@ exec "${FM_TEST_REAL_CAT:?FM_TEST_REAL_CAT unset}" "$@"
 SH
     chmod +x "$fakebin/cat"
 
-    if FM_TEST_CYGWIN_PS_LOG="$cygwin_ps_log" FM_TEST_REAL_PS="$real_ps" \
+    if FM_TEST_CYGWIN_PS_LOG="$production_ps_log" FM_TEST_REAL_PS="$real_ps" \
       "$fakebin/ps" -p "$$" -o ppid= >/dev/null 2>&1; then
       fail "Cygwin-like ps fixture unexpectedly accepted -o"
     fi
-    : > "$cygwin_ps_log"
+    : > "$production_ps_log"
   fi
 
   # Hold only the arm parent's identity read after it has emitted the real
@@ -1219,7 +1220,7 @@ SH
     "FM_POLL=30" "FM_SIGNAL_GRACE=1" "FM_CHECK_INTERVAL=999999" "FM_HEARTBEAT=999999"
     "FM_TEST_REAL_BASH=$real_bash" "FM_TEST_REAL_CAT=$real_cat" "FM_TEST_REAL_OD=$real_od"
     "FM_TEST_REAL_PS=$real_ps" "FM_TEST_REAL_SLEEP=$real_sleep" "FM_TEST_STATE=$state"
-    "FM_TEST_CYGWIN_PS_LOG=$cygwin_ps_log" "FM_TEST_PROC_STAT_LOG=$proc_stat_log"
+    "FM_TEST_CYGWIN_PS_LOG=$production_ps_log" "FM_TEST_PROC_STAT_LOG=$proc_stat_log"
     "FM_TEST_WATCH_PATH=$WATCH" "FM_TEST_WATCH_EXEC_READY=$exec_ready"
     "FM_TEST_WATCH_EXEC_RELEASE=$exec_release" "FM_TEST_PRECONFIRM_CLAIM=$claim"
     "FM_TEST_PRECONFIRM_READY=$ready" "FM_TEST_PRECONFIRM_RELEASE=$release"
@@ -1296,7 +1297,21 @@ SH
   is_live_non_zombie "$od_pid" && od_survived=1
   test_pid_matches_identity "$sentinel_pid" "$sentinel_identity" && sentinel_untouched=1
   lifecycle_row=$(tail -1 "$state/.watch-cycle-exits.log" 2>/dev/null || true)
-  child_identity=$(fm_test_pid_identity "$child_pid" 2>/dev/null || true)
+  if [ "${FM_TEST_ARM_CYGWIN_GONE_IDENTITY:-0}" = 1 ]; then
+    ! is_live_non_zombie "$child_pid" \
+      || fail "gone-identity fixture reached cleanup before the watcher disappeared"
+  fi
+  if [ "$child_survived" -eq 0 ]; then
+    child_identity=${stable_identity:-}
+  elif [ -n "${stable_identity:-}" ]; then
+    child_identity=$stable_identity
+  elif [ "${FM_TEST_ARM_CYGWIN_PS:-0}" = 1 ]; then
+    child_identity=$(PATH="$fakebin:$PATH" FM_TEST_WATCH_PATH="$WATCH" \
+      FM_TEST_REAL_BASH="$real_bash" FM_TEST_CYGWIN_PS_LOG="$fixture_ps_log" \
+      FM_TEST_REAL_PS="$real_ps" fm_test_pid_identity "$child_pid" 2>/dev/null || true)
+  else
+    child_identity=$(fm_test_pid_identity "$child_pid" 2>/dev/null || true)
+  fi
 
   # RED containment remains exact-PID/exact-identity. It runs before assertions
   # so the intentionally failing original implementation cannot leak the child.
@@ -1329,8 +1344,12 @@ SH
   if [ "${FM_TEST_ARM_CYGWIN_PS:-0}" = 1 ]; then
     grep -Fx "$child_pid" "$proc_stat_log" >/dev/null \
       || fail "Cygwin-like /proc fixture did not exercise the child stat parser"
-    [ ! -s "$cygwin_ps_log" ] \
-      || fail "Cygwin-like watcher cleanup invoked unsupported ps -o: $(tr '\n' ';' < "$cygwin_ps_log")"
+    [ ! -s "$production_ps_log" ] \
+      || fail "Cygwin-like production cleanup invoked unsupported ps -o: $(tr '\n' ';' < "$production_ps_log")"
+    if [ "${FM_TEST_ARM_CYGWIN_GONE_IDENTITY:-0}" = 1 ]; then
+      [ ! -s "$fixture_ps_log" ] \
+        || fail "gone-child test cleanup performed an unnecessary identity fallback"
+    fi
   fi
   pass "pre-confirmation $startup_signal reaps only the exact newly spawned watcher"
 )
