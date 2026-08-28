@@ -2747,10 +2747,12 @@ import { syncBuiltinESMExports } from "node:module";
 import { pathToFileURL } from "node:url";
 
 const originalSpawn = childProcess.spawn;
+let injectedEpipeCount = 0;
 childProcess.spawn = (command, args, options) => {
   const child = originalSpawn(command, args, options);
   if (String(command).endsWith("/bin/fm-turnend-guard.sh")) {
     queueMicrotask(() => {
+      injectedEpipeCount += 1;
       const error = Object.assign(new Error("write EPIPE"), { code: "EPIPE", errno: -32, syscall: "write" });
       child.stdin.emit("error", error);
     });
@@ -2774,6 +2776,9 @@ const guardHooks = await guardMod.FmPrimaryTurnendGuard({
   worktree: process.env.WORKTREE,
 });
 await guardHooks.event({ event: { type: "session.idle", properties: { sessionID: "session-test" } } });
+if (injectedEpipeCount !== 1) {
+  throw new Error(`expected exactly one injected stdin EPIPE, got ${injectedEpipeCount}`);
+}
 if (!promptBody.includes("TURN WOULD END BLIND")) {
   throw new Error(`stdin EPIPE suppressed the blind-turn prompt: ${promptBody}`);
 }
