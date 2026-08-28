@@ -92,9 +92,16 @@ cleanup_arm_hup_probe() {
   local cleanup_rc=0
   trap - EXIT INT TERM
   [ "${arm_cleanup_active:-0}" = 1 ] || return 0
+  if test_pid_matches_identity "${fresh_sleep_pid:-}" "${fresh_sleep_identity:-}"; then
+    kill -TERM "$fresh_sleep_pid" 2>/dev/null || true
+  fi
   cleanup_identity_bound_arm_pair \
     "${armpid:-}" "${arm_identity:-}" "${lock_pid:-}" "${lock_identity:-}" 1 \
     || cleanup_rc=$?
+  if test_pid_matches_identity "${sentinel_pid:-}" "${sentinel_identity:-}"; then
+    kill -TERM "$sentinel_pid" 2>/dev/null || true
+    wait "$sentinel_pid" 2>/dev/null || true
+  fi
   if [ -n "${evidence_dir:-}" ]; then
     printf '%s\n' "$cleanup_rc" > "$evidence_dir/cleanup.rc"
   fi
@@ -774,7 +781,9 @@ test_arm_starts_and_self_heals() {
 
 test_arm_hup_cleans_child_and_temp_output() (
   local dir state fakebin armout poll_ready real_sleep stale_generation delayed_generation fresh_generation
-  local evidence_dir arm_identity lock_identity i armpid lock_pid status
+  local evidence_dir arm_identity lock_identity i armpid lock_pid status arm_exit_polls stopped_mode
+  local watcher_parent watcher_state fresh_sleep_pid fresh_sleep_identity fresh_sleep_parent
+  local sentinel_pid sentinel_identity lifecycle_row
   local arm_cleanup_active
   dir=$(make_case arm-hup-cleanup)
   state="$dir/state"
@@ -782,9 +791,15 @@ test_arm_hup_cleans_child_and_temp_output() (
   armout="$dir/arm.out"
   poll_ready="$dir/poll-sleep.ready"
   real_sleep=$(command -v sleep)
+  arm_exit_polls=${FM_TEST_ARM_HUP_EXIT_POLLS:-$ARM_FAIL_EXIT_POLLS}
+  stopped_mode=${FM_TEST_ARM_HUP_STOPPED_CHILD:-0}
   arm_cleanup_active=0
   lock_pid=
   lock_identity=
+  fresh_sleep_pid=
+  fresh_sleep_identity=
+  sentinel_pid=
+  sentinel_identity=
   cat > "$fakebin/sleep" <<'SH'
 #!/usr/bin/env bash
 set -u
@@ -868,11 +883,38 @@ SH
   done
   [ -n "$fresh_generation" ] && [ "$fresh_generation" != "$stale_generation" ] \
     || fail "watcher did not publish a fresh foreground-sleep generation"
+  if [ "$stopped_mode" = 1 ]; then
+    watcher_parent=$(ps -p "$lock_pid" -o ppid= 2>/dev/null | tr -d '[:space:]')
+    [ "$watcher_parent" = "$armpid" ] \
+      || fail "identity-bound watcher was not the arm's direct child (parent '$watcher_parent', arm '$armpid')"
+    fresh_sleep_pid=$fresh_generation
+    fresh_sleep_identity=$(fm_test_pid_identity "$fresh_sleep_pid" 2>/dev/null || true)
+    [ -n "$fresh_sleep_identity" ] || fail "could not bind the active watcher sleep identity"
+    fresh_sleep_parent=$(ps -p "$fresh_sleep_pid" -o ppid= 2>/dev/null | tr -d '[:space:]')
+    [ "$fresh_sleep_parent" = "$lock_pid" ] \
+      || fail "fresh foreground sleep was not owned by the exact watcher"
+    "$real_sleep" 60 &
+    sentinel_pid=$!
+    sentinel_identity=$(fm_test_pid_identity "$sentinel_pid" 2>/dev/null || true)
+    [ -n "$sentinel_identity" ] || fail "could not bind unrelated sentinel identity"
+    kill -STOP "$lock_pid" 2>/dev/null || fail "could not stop exact owned watcher before HUP"
+    i=0
+    while [ "$i" -lt 20 ]; do
+      watcher_state=$(ps -p "$lock_pid" -o stat= 2>/dev/null | tr -d '[:space:]')
+      case "$watcher_state" in T*) break ;; esac
+      sleep 0.1
+      i=$((i + 1))
+    done
+    case "$watcher_state" in
+      T*) ;;
+      *) fail "exact owned watcher did not enter the stopped state before HUP" ;;
+    esac
+  fi
   kill -HUP "$armpid" 2>/dev/null || fail "could not send HUP to arm"
   # The arm waits for owned watcher cleanup, and Bash may defer the watcher's
   # TERM trap until its foreground poll command returns. Use the shared ceiling
   # that already covers the largest production confirmation budget.
-  wait_for_exit "$armpid" "$ARM_FAIL_EXIT_POLLS"
+  wait_for_exit "$armpid" "$arm_exit_polls"
   status=$?
   [ "$status" -eq 129 ] || fail "arm did not exit with HUP status (got $status)"
   i=0
@@ -882,10 +924,46 @@ SH
   done
   ! is_live_non_zombie "$lock_pid" || fail "HUP cleanup left watcher child running"
   ! ls "$state"/.watch-arm-output.* >/dev/null 2>&1 || fail "HUP cleanup left temp output behind"
+  if [ "$stopped_mode" = 1 ]; then
+    test_pid_matches_identity "$sentinel_pid" "$sentinel_identity" \
+      || fail "bounded arm shutdown signalled an unrelated process"
+    lifecycle_row=$(tail -1 "$state/.watch-cycle-exits.log" 2>/dev/null || true)
+    case "$lifecycle_row" in
+      "arm_pid=$armpid"$'\t'"watcher_pid=$lock_pid"$'\t'*$'\t'"exit_code=129"$'\t'"signal=HUP"$'\t'"reason=arm-interrupted"$'\t'*) ;;
+      *) fail "bounded stopped-watcher shutdown did not preserve the HUP lifecycle row: $lifecycle_row" ;;
+    esac
+    [ "$(cat "$state/.watch.lock/pid" 2>/dev/null || true)" = "$lock_pid" ] \
+      || fail "escalated shutdown discarded recoverable stale-lock pid evidence"
+    [ "$(cat "$state/.watch.lock/pid-identity" 2>/dev/null || true)" = "$lock_identity" ] \
+      || fail "escalated shutdown discarded recoverable stale-lock identity evidence"
+    kill -TERM "$sentinel_pid" 2>/dev/null || true
+    wait "$sentinel_pid" 2>/dev/null || true
+    sentinel_pid=
+    sentinel_identity=
+    if test_pid_matches_identity "$fresh_sleep_pid" "$fresh_sleep_identity"; then
+      kill -TERM "$fresh_sleep_pid" 2>/dev/null || true
+    fi
+    fresh_sleep_pid=
+    fresh_sleep_identity=
+  fi
   arm_cleanup_active=0
   trap - EXIT
   pass "arm cleans child watcher and temp output on HUP"
 )
+
+test_arm_hup_bounds_stopped_owned_child() {
+  local log rc=0
+  log="$TMP_ROOT/arm-hup-stopped-child.log"
+  FM_TEST_ARM_HUP_STOPPED_CHILD=1 FM_TEST_ARM_HUP_EXIT_POLLS=30 \
+    FM_ARM_SHUTDOWN_GRACE_POLLS=2 bash "$0" > "$log" 2>&1 || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    cat "$log" >&2
+    fail "arm did not bound HUP shutdown of its stopped identity-bound watcher (status $rc)"
+  fi
+  grep -F 'ok - arm cleans child watcher and temp output on HUP' "$log" >/dev/null \
+    || fail "stopped-watcher shutdown probe did not complete its behavior contract"
+  pass "arm bounds HUP shutdown of a stopped identity-bound watcher without collateral signaling"
+}
 
 test_arm_hup_preserves_caller_traps() {
   local dir noop before after after_source probe_rc changed=0
@@ -1342,6 +1420,11 @@ test_msys_pid_identity_uses_proc() {
   pass "MSYS process identity uses compatible /proc fields"
 }
 
+if [ "${FM_TEST_ARM_HUP_STOPPED_CHILD:-0}" = 1 ]; then
+  test_arm_hup_cleans_child_and_temp_output
+  exit $?
+fi
+
 if [ "${FM_TEST_FORCE_ARM_HUP_TERM:-0}" = 1 ]; then
   test_arm_hup_cleans_child_and_temp_output
   exit $?
@@ -1372,6 +1455,7 @@ test_attached_arm_signal_is_recorded_in_cycle_ledger
 test_arm_starts_and_self_heals
 test_arm_hup_scoped_cleanup_on_forced_term
 test_arm_hup_preserves_caller_traps
+test_arm_hup_bounds_stopped_owned_child
 test_arm_propagates_immediate_wake_before_confirmation
 test_arm_waits_for_peer_beacon_after_child_stands_down
 test_arm_fails_loud_when_no_fresh_watcher_confirmable

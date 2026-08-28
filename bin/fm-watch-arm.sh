@@ -79,6 +79,13 @@ esac
 CONFIRM_TIMEOUT=${FM_ARM_CONFIRM_TIMEOUT:-$ARM_CONFIRM_DEFAULT}
 # Poll interval while attached to an existing healthy watcher.
 ATTACH_POLL=${FM_ARM_ATTACH_POLL:-0.5}
+# Signal shutdown gives the exact owned watcher a short graceful interval before
+# escalating. Both the TERM and post-KILL waits use 0.1-second polls; the test
+# seam stays numeric and bounded on Bash 3.2 platforms.
+ARM_SHUTDOWN_GRACE_POLLS=${FM_ARM_SHUTDOWN_GRACE_POLLS:-50}
+case "$ARM_SHUTDOWN_GRACE_POLLS" in
+  ''|*[!0-9]*|0) ARM_SHUTDOWN_GRACE_POLLS=50 ;;
+esac
 CYCLE_LOG="$STATE/.watch-cycle-exits.log"
 CYCLE_LOG_LOCK="$STATE/.watch-cycle-exits.lock"
 CYCLE_LOG_MAX_BYTES=${FM_WATCH_CYCLE_LOG_MAX_BYTES:-262144}
@@ -448,6 +455,44 @@ fi
 # wake exit propagates out so the harness re-notifies firstmate.
 child=
 child_out=
+# shellcheck disable=SC2329 # Invoked by the signal-handler path below.
+owned_child_identity_matches() {
+  local current
+  [ -n "$child" ] || return 1
+  [ "$child" = "$cycle_watcher_pid" ] || return 1
+  [ -n "$cycle_watcher_identity" ] && [ "$cycle_watcher_identity" != none ] || return 1
+  current=$(fm_pid_identity "$child" 2>/dev/null) || return 1
+  [ "$current" = "$cycle_watcher_identity" ]
+}
+
+# Poll before calling wait: Bash 3.2 has no timed wait, and wait itself is the
+# defect boundary when a child cannot service TERM. Return 0 only after the
+# child is observed gone and reaped, 1 when the same owned child remains at the
+# deadline, and 2 when the pid can no longer be proven to be that child.
+# shellcheck disable=SC2329 # Invoked by the signal-handler path below.
+wait_owned_child_bounded() {
+  local i=0 child_state
+  while [ "$i" -lt "$ARM_SHUTDOWN_GRACE_POLLS" ]; do
+    if ! fm_pid_alive "$child"; then
+      wait "$child" 2>/dev/null || true
+      child=
+      return 0
+    fi
+    child_state=$(ps -p "$child" -o stat= 2>/dev/null | tr -d '[:space:]')
+    case "$child_state" in
+      Z*)
+        wait "$child" 2>/dev/null || true
+        child=
+        return 0
+        ;;
+    esac
+    owned_child_identity_matches || return 2
+    sleep 0.1
+    i=$((i + 1))
+  done
+  return 1
+}
+
 cleanup_child() {
   if [ -n "$child" ] && fm_pid_alive "$child"; then
     kill -TERM "$child" 2>/dev/null || true
@@ -459,13 +504,23 @@ cleanup_child() {
 
 # shellcheck disable=SC2329 # Invoked indirectly by the signal traps below.
 handle_arm_signal() {
-  local signal=$1 rc=$2
+  local signal=$1 rc=$2 wait_rc=0
   trap - HUP TERM INT
-  if [ -n "$child" ] && fm_pid_alive "$child"; then
+  if owned_child_identity_matches; then
     kill -TERM "$child" 2>/dev/null || true
-    wait "$child" 2>/dev/null || true
+    wait_owned_child_bounded || wait_rc=$?
+    if [ "$wait_rc" -eq 1 ] && owned_child_identity_matches; then
+      kill -CONT "$child" 2>/dev/null || true
+      if owned_child_identity_matches; then
+        kill -KILL "$child" 2>/dev/null || true
+      fi
+      wait_owned_child_bounded || true
+    fi
   fi
   cycle_log_append "$rc" "$signal" arm-interrupted none
+  # Never let cleanup_child re-signal a pid whose ownership may have changed.
+  # The bounded path above is the signal handler's sole child-signal owner.
+  child=
   cleanup_child
   exit "$rc"
 }
