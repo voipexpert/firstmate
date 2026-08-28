@@ -2727,35 +2727,38 @@ EOF
   pass "OpenCode watcher plugin coordinates with the turn-end guard"
 }
 
-test_opencode_healthy_arm_output_does_not_suppress_guard() {
-  local arm_plugin guard_plugin repo home log guard_log out status
-  arm_plugin="$ROOT/.opencode/plugins/fm-primary-watch-arm.js"
+test_opencode_turnend_guard_survives_stdin_epipe() {
+  local guard_plugin repo home out status
   guard_plugin="$ROOT/.opencode/plugins/fm-primary-turnend-guard.js"
-  repo="$TMP_ROOT/opencode-external-healthy-root"
-  home="$TMP_ROOT/opencode-external-healthy-home"
-  log="$TMP_ROOT/opencode-external-healthy-arm.log"
-  guard_log="$TMP_ROOT/opencode-external-healthy-guard.log"
-  mkdir -p "$repo/bin" "$home/state" "$home/config"
+  repo="$TMP_ROOT/opencode-guard-stdin-epipe-root"
+  home="$TMP_ROOT/opencode-guard-stdin-epipe-home"
+  mkdir -p "$repo/bin" "$home/state"
   git init -q "$repo"
-  : > "$repo/AGENTS.md"
-  : > "$home/state/task.meta"
-  cat > "$repo/bin/fm-watch-arm.sh" <<'SH'
-#!/usr/bin/env bash
-printf 'args=%s\n' "$*" >> "${FM_ARM_LOG:?}"
-printf 'watcher: healthy pid=1 (beacon 0s)\n'
-SH
   cat > "$repo/bin/fm-turnend-guard.sh" <<'SH'
 #!/usr/bin/env bash
-printf 'guard\n' >> "${FM_GUARD_LOG:?}"
-printf 'guard ran after external healthy watcher\n' >&2
+cat >/dev/null
+printf 'guard ran after an injected stdin EPIPE\n' >&2
 exit 2
 SH
-  chmod +x "$repo/bin/fm-watch-arm.sh" "$repo/bin/fm-turnend-guard.sh"
-  out=$(ARM_PLUGIN="$arm_plugin" GUARD_PLUGIN="$guard_plugin" WORKTREE="$repo" FM_HOME="$home" FM_ARM_LOG="$log" FM_GUARD_LOG="$guard_log" node 2>&1 <<'EOF'
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+  chmod +x "$repo/bin/fm-turnend-guard.sh"
+  out=$(GUARD_PLUGIN="$guard_plugin" WORKTREE="$repo" FM_HOME="$home" node 2>&1 <<'EOF'
+import childProcess from "node:child_process";
+import { syncBuiltinESMExports } from "node:module";
 import { pathToFileURL } from "node:url";
 
-const armMod = await import(pathToFileURL(process.env.ARM_PLUGIN).href);
+const originalSpawn = childProcess.spawn;
+childProcess.spawn = (command, args, options) => {
+  const child = originalSpawn(command, args, options);
+  if (String(command).endsWith("/bin/fm-turnend-guard.sh")) {
+    queueMicrotask(() => {
+      const error = Object.assign(new Error("write EPIPE"), { code: "EPIPE", errno: -32, syscall: "write" });
+      child.stdin.emit("error", error);
+    });
+  }
+  return child;
+};
+syncBuiltinESMExports();
+
 const guardMod = await import(pathToFileURL(process.env.GUARD_PLUGIN).href);
 let promptBody = "";
 const client = {
@@ -2765,6 +2768,117 @@ const client = {
     },
   },
 };
+const guardHooks = await guardMod.FmPrimaryTurnendGuard({
+  client,
+  directory: process.env.WORKTREE,
+  worktree: process.env.WORKTREE,
+});
+await guardHooks.event({ event: { type: "session.idle", properties: { sessionID: "session-test" } } });
+if (!promptBody.includes("TURN WOULD END BLIND")) {
+  throw new Error(`stdin EPIPE suppressed the blind-turn prompt: ${promptBody}`);
+}
+EOF
+)
+  status=$?
+  expect_code 0 "$status" "OpenCode turn-end guard must survive child stdin EPIPE: $out"
+  [ -z "$out" ] || fail "OpenCode turn-end guard stdin-EPIPE test printed output: $out"
+  pass "OpenCode turn-end guard survives child stdin EPIPE"
+}
+
+test_opencode_healthy_arm_output_does_not_suppress_guard() {
+  local arm_plugin guard_plugin repo home log guard_log guard_input_log out status
+  arm_plugin="$ROOT/.opencode/plugins/fm-primary-watch-arm.js"
+  guard_plugin="$ROOT/.opencode/plugins/fm-primary-turnend-guard.js"
+  repo="$TMP_ROOT/opencode-external-healthy-root"
+  home="$TMP_ROOT/opencode-external-healthy-home"
+  log="$TMP_ROOT/opencode-external-healthy-arm.log"
+  guard_log="$TMP_ROOT/opencode-external-healthy-guard.log"
+  guard_input_log="$TMP_ROOT/opencode-external-healthy-guard-input.log"
+  mkdir -p "$repo/bin" "$home/state" "$home/config"
+  git init -q "$repo"
+  : > "$repo/AGENTS.md"
+  : > "$home/state/task.meta"
+  cat > "$repo/bin/fm-watch-arm.sh" <<'SH'
+#!/usr/bin/env bash
+printf 'args=%s\n' "$*" >> "${FM_ARM_LOG:?}"
+printf 'watcher: healthy pid=1 (beacon 0s)\n'
+if [ -n "${FM_TEST_ARM_CLOSE_RELEASE_FILE:-}" ]; then
+  wait_count=0
+  while [ ! -e "$FM_TEST_ARM_CLOSE_RELEASE_FILE" ] && [ "$wait_count" -lt 250 ]; do
+    sleep 0.01
+    wait_count=$((wait_count + 1))
+  done
+  [ -e "$FM_TEST_ARM_CLOSE_RELEASE_FILE" ] || exit 3
+fi
+SH
+  cat > "$repo/bin/fm-turnend-guard.sh" <<'SH'
+#!/usr/bin/env bash
+payload=$(cat)
+printf '%s' "$payload" > "${FM_GUARD_INPUT_LOG:?}"
+printf 'guard\n' >> "${FM_GUARD_LOG:?}"
+printf 'guard ran after external healthy watcher\n' >&2
+exit 2
+SH
+  chmod +x "$repo/bin/fm-watch-arm.sh" "$repo/bin/fm-turnend-guard.sh"
+  out=$(ARM_PLUGIN="$arm_plugin" GUARD_PLUGIN="$guard_plugin" WORKTREE="$repo" FM_HOME="$home" FM_ARM_LOG="$log" FM_GUARD_LOG="$guard_log" FM_GUARD_INPUT_LOG="$guard_input_log" \
+    FM_TEST_ARM_CLOSE_RELEASE_FILE="${FM_TEST_ARM_CLOSE_RELEASE_FILE:-}" \
+    FM_TEST_WAIT_FOR_WATCHER_PROMPT="${FM_TEST_WAIT_FOR_WATCHER_PROMPT:-}" \
+    FM_WATCH_REARM_RETRY_BASE_MS="${FM_WATCH_REARM_RETRY_BASE_MS:-}" \
+    FM_WATCH_REARM_RETRY_MAX_MS="${FM_WATCH_REARM_RETRY_MAX_MS:-}" \
+    FM_WATCH_REARM_RETRY_LIMIT="${FM_WATCH_REARM_RETRY_LIMIT:-}" \
+    node 2>&1 <<'EOF'
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { pathToFileURL } from "node:url";
+
+const armMod = await import(pathToFileURL(process.env.ARM_PLUGIN).href);
+const guardMod = await import(pathToFileURL(process.env.GUARD_PLUGIN).href);
+const promptBodies = [];
+let resolveWatcherPrompt;
+const watcherPromptObserved = new Promise((resolve) => {
+  resolveWatcherPrompt = resolve;
+});
+const waitForWatcherPrompt = () => new Promise((resolve, reject) => {
+  const timer = setTimeout(() => reject(new Error("concurrent watcher prompt did not arrive")), 2000);
+  watcherPromptObserved.then(() => {
+    clearTimeout(timer);
+    resolve();
+  });
+});
+const client = {
+  session: {
+    promptAsync: async (request) => {
+      const text = request.body.parts[0].text;
+      promptBodies.push(text);
+      if (!text.includes("TURN WOULD END BLIND")) {
+        resolveWatcherPrompt();
+      } else if (process.env.FM_TEST_WAIT_FOR_WATCHER_PROMPT === "1") {
+        writeFileSync(process.env.FM_TEST_ARM_CLOSE_RELEASE_FILE, "release\n");
+        await waitForWatcherPrompt();
+      }
+    },
+  },
+};
+const logState = (path, marker) => {
+  try {
+    const value = readFileSync(path, "utf8");
+    return { exists: true, bytes: Buffer.byteLength(value), marker: value.includes(marker) };
+  } catch {
+    return { exists: false, bytes: 0, marker: false };
+  }
+};
+const diagnosticSnapshot = () => JSON.stringify({
+  arm: { log: logState(process.env.FM_ARM_LOG, "args=--restart") },
+  guard: {
+    log: logState(process.env.FM_GUARD_LOG, "guard"),
+    input: logState(process.env.FM_GUARD_INPUT_LOG, '{"stop_hook_active":false}'),
+  },
+  prompt: {
+    count: promptBodies.length,
+    bytes: promptBodies.reduce((total, text) => total + Buffer.byteLength(text), 0),
+    blind: promptBodies.some((text) => text.includes("TURN WOULD END BLIND")),
+    latestBlind: (promptBodies.at(-1) ?? "").includes("TURN WOULD END BLIND"),
+  },
+});
 await armMod.FmPrimaryWatchArm({
   client,
   directory: process.env.WORKTREE,
@@ -2780,28 +2894,72 @@ await guardHooks.event({ event: { type: "session.idle", properties: { sessionID:
 for (let i = 0; i < 250 && !existsSync(process.env.FM_GUARD_LOG); i += 1) {
   await new Promise((resolve) => setTimeout(resolve, 20));
 }
-if (!existsSync(process.env.FM_ARM_LOG)) {
-  console.error("watch arm did not run");
-  process.exit(1);
-}
-if (!readFileSync(process.env.FM_ARM_LOG, "utf8").includes("args=--restart")) {
-  console.error("watch arm was not asked to restart into an owned child");
-  process.exit(1);
-}
-if (!existsSync(process.env.FM_GUARD_LOG)) {
-  console.error("turn-end guard was suppressed by an external healthy watcher");
-  process.exit(1);
-}
-if (!promptBody.includes("TURN WOULD END BLIND")) {
-  console.error(`missing blind-turn prompt: ${promptBody}`);
-  process.exit(1);
+try {
+  if (process.env.FM_TEST_FORCE_OPENCODE_EMBEDDED_FAILURE === "1") {
+    throw new Error("forced embedded assertion");
+  }
+  if (!existsSync(process.env.FM_ARM_LOG)) {
+    throw new Error("watch arm did not run");
+  }
+  if (!readFileSync(process.env.FM_ARM_LOG, "utf8").includes("args=--restart")) {
+    throw new Error("watch arm was not asked to restart into an owned child");
+  }
+  if (!existsSync(process.env.FM_GUARD_LOG)) {
+    throw new Error("turn-end guard was suppressed by an external healthy watcher");
+  }
+  if (!existsSync(process.env.FM_GUARD_INPUT_LOG)) {
+    throw new Error("turn-end guard fixture did not consume the hook payload");
+  }
+  if (readFileSync(process.env.FM_GUARD_INPUT_LOG, "utf8") !== '{"stop_hook_active":false}') {
+    throw new Error("turn-end guard fixture received the wrong hook payload");
+  }
+  if (!promptBodies.some((text) => text.includes("TURN WOULD END BLIND"))) {
+    throw new Error("missing blind-turn prompt");
+  }
+  if (process.env.FM_TEST_WAIT_FOR_WATCHER_PROMPT === "1" && promptBodies.length < 2) {
+    throw new Error("concurrent watcher prompt perturbation did not occur");
+  }
+} catch (error) {
+  console.error(`embedded assertion: ${String(error?.message ?? error)}`);
+  console.error(`FM_OPENCODE_DIAGNOSTIC ${diagnosticSnapshot()}`);
+  process.exitCode = 1;
 }
 EOF
 )
   status=$?
-  expect_code 0 "$status" "OpenCode watch plugin must not treat external healthy output as an owned arm"
+  expect_code 0 "$status" "OpenCode watch plugin must not treat external healthy output as an owned arm${out:+: $out}"
   [ -z "$out" ] || fail "OpenCode external-healthy test printed output: $out"
   pass "OpenCode healthy arm output does not suppress the turn-end guard"
+}
+
+test_opencode_embedded_failure_surfaces_bounded_snapshot() {
+  local out status
+  out=$(TMP_ROOT="$TMP_ROOT/opencode-embedded-diagnostic" \
+    FM_TEST_FORCE_OPENCODE_EMBEDDED_FAILURE=1 \
+    FM_TEST_SECRET_CANARY='must-not-appear-in-diagnostics' \
+    test_opencode_healthy_arm_output_does_not_suppress_guard 2>&1)
+  status=$?
+  expect_code 1 "$status" "forced embedded OpenCode assertion must fail"
+  assert_contains "$out" "forced embedded assertion" "embedded assertion stderr must reach the shell failure"
+  assert_contains "$out" 'FM_OPENCODE_DIAGNOSTIC {"arm"' "embedded assertion must include a structured state snapshot"
+  assert_not_contains "$out" "must-not-appear-in-diagnostics" "embedded assertion diagnostics must not leak unrelated environment values"
+  [ "${#out}" -le 1024 ] || fail "embedded assertion diagnostics must stay bounded (got ${#out} bytes)"
+  pass "OpenCode embedded assertion surfaces a bounded structured snapshot"
+}
+
+test_opencode_concurrent_failure_prompt_does_not_mask_guard_delivery() {
+  local case_root out status
+  case_root="$TMP_ROOT/opencode-concurrent-prompt"
+  out=$(TMP_ROOT="$case_root" \
+    FM_TEST_ARM_CLOSE_RELEASE_FILE="$case_root/arm-close.release" \
+    FM_TEST_WAIT_FOR_WATCHER_PROMPT=1 \
+    FM_WATCH_REARM_RETRY_BASE_MS=5 \
+    FM_WATCH_REARM_RETRY_MAX_MS=5 \
+    FM_WATCH_REARM_RETRY_LIMIT=1 \
+    test_opencode_healthy_arm_output_does_not_suppress_guard 2>&1)
+  status=$?
+  expect_code 0 "$status" "a concurrent watcher failure prompt must not hide an already delivered turn-end guard: $out"
+  pass "OpenCode concurrent failure prompt does not mask guard delivery"
 }
 
 test_pi_extension_reports_external_healthy_watcher
@@ -2840,4 +2998,7 @@ test_opencode_empty_close_retries_instead_of_disappearing
 test_opencode_established_empty_close_honors_retry_limit
 test_opencode_actionable_close_rechecks_session_lock
 test_opencode_watch_arm_coordinates_with_turnend_guard
+test_opencode_turnend_guard_survives_stdin_epipe
 test_opencode_healthy_arm_output_does_not_suppress_guard
+test_opencode_embedded_failure_surfaces_bounded_snapshot
+test_opencode_concurrent_failure_prompt_does_not_mask_guard_delivery
