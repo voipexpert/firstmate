@@ -708,7 +708,8 @@ test_arm_starts_and_self_heals() {
 }
 
 test_arm_hup_cleans_child_and_temp_output() {
-  local dir state fakebin armout poll_ready real_sleep i armpid lock_pid status
+  local dir state fakebin armout poll_ready real_sleep stale_generation delayed_generation fresh_generation
+  local i armpid lock_pid status
   dir=$(make_case arm-hup-cleanup)
   state="$dir/state"
   fakebin="$dir/fakebin"
@@ -719,7 +720,10 @@ test_arm_hup_cleans_child_and_temp_output() {
 #!/usr/bin/env bash
 set -u
 if [ "${1:-}" = "${FM_TEST_BLOCKING_SLEEP_SECONDS:-}" ]; then
-  : > "${FM_TEST_BLOCKING_SLEEP_READY:?FM_TEST_BLOCKING_SLEEP_READY unset}"
+  ready=${FM_TEST_BLOCKING_SLEEP_READY:?FM_TEST_BLOCKING_SLEEP_READY unset}
+  tmp="$ready.$$"
+  printf '%s\n' "$$" > "$tmp"
+  mv -f "$tmp" "$ready"
 fi
 exec "${FM_TEST_REAL_SLEEP:?FM_TEST_REAL_SLEEP unset}" "$@"
 SH
@@ -743,6 +747,30 @@ SH
     i=$((i + 1))
   done
   [ -e "$poll_ready" ] || fail "watcher did not enter the synchronized foreground poll sleep"
+  stale_generation=$(cat "$poll_ready")
+  [ -n "$stale_generation" ] || fail "watcher published an empty foreground-sleep generation"
+  kill -STOP "$lock_pid" 2>/dev/null || fail "could not pause watcher for delayed readiness counterfactual"
+  "$real_sleep" 1 || {
+    kill -CONT "$lock_pid" 2>/dev/null || true
+    fail "delayed readiness counterfactual could not wait"
+  }
+  delayed_generation=$(cat "$poll_ready" 2>/dev/null || true)
+  if [ "$delayed_generation" != "$stale_generation" ]; then
+    kill -CONT "$lock_pid" 2>/dev/null || true
+    fail "delayed readiness counterfactual did not retain the pre-start sleep generation"
+  fi
+  rm -f "$poll_ready"
+  kill -CONT "$lock_pid" 2>/dev/null || fail "could not resume watcher for a fresh sleep generation"
+  fresh_generation=
+  i=0
+  while [ "$i" -lt "$ARM_FAIL_EXIT_POLLS" ]; do
+    fresh_generation=$(cat "$poll_ready" 2>/dev/null || true)
+    [ -n "$fresh_generation" ] && [ "$fresh_generation" != "$stale_generation" ] && break
+    sleep 0.1
+    i=$((i + 1))
+  done
+  [ -n "$fresh_generation" ] && [ "$fresh_generation" != "$stale_generation" ] \
+    || fail "watcher did not publish a fresh foreground-sleep generation"
   kill -HUP "$armpid" 2>/dev/null || fail "could not send HUP to arm"
   # The arm waits for owned watcher cleanup, and Bash may defer the watcher's
   # TERM trap until its foreground poll command returns. Use the shared ceiling
