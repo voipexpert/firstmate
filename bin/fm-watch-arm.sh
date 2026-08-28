@@ -483,7 +483,7 @@ child_process_snapshot_for_pid() {
     ''|*[!0-9]*) return 1 ;;
   esac
   proc_root=${FM_PROC_ROOT_OVERRIDE:-/proc}
-  if [ -d "$proc_root" ]; then
+  if fm_proc_pid_facility_available; then
     [ -r "$proc_root/$pid/stat" ] || return 1
     stat_line=$(cat "$proc_root/$pid/stat" 2>/dev/null) || return 1
     stat_tail=${stat_line##*)}

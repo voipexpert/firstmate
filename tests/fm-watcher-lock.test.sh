@@ -2087,6 +2087,50 @@ test_proc_pid_identity_ignores_wall_clock_and_detects_pid_reuse() {
   pass "/proc process identity detects pid reuse"
 }
 
+test_proc_identity_disappearance_does_not_switch_to_ps() (
+  local dir state proc_root fakebin ps_log live before after alive_before=0 alive_after=0
+  dir=$(make_case proc-identity-disappears)
+  state="$dir/state"
+  proc_root="$dir/proc"
+  fakebin="$dir/fakebin"
+  ps_log="$dir/ps.log"
+  mkdir -p "$proc_root" "$fakebin"
+  sleep 300 &
+  live=$!
+  write_fake_proc_identity "$proc_root" "$live" 987654
+
+  before=$(FM_PROC_ROOT_OVERRIDE="$proc_root" FM_STATE_OVERRIDE="$state" \
+    bash -c '. "$1"; fm_pid_identity "$2"' _ "$LIB" "$live") \
+    || fail "could not read identity before the per-PID /proc entry disappeared"
+  FM_PROC_ROOT_OVERRIDE="$proc_root" FM_STATE_OVERRIDE="$state" \
+    bash -c '. "$1"; fm_pid_alive "$2"' _ "$LIB" "$live" \
+    && alive_before=1
+
+  rm -f -- "$proc_root/$live/stat" "$proc_root/$live/cmdline"
+  rmdir -- "$proc_root/$live"
+  cat > "$fakebin/ps" <<'SH'
+#!/usr/bin/env bash
+set -u
+printf '%s\n' "$*" >> "${FM_TEST_PS_LOG:?FM_TEST_PS_LOG unset}"
+exit 64
+SH
+  chmod +x "$fakebin/ps"
+  after=$(PATH="$fakebin:$PATH" FM_TEST_PS_LOG="$ps_log" \
+    FM_PROC_ROOT_OVERRIDE="$proc_root" FM_STATE_OVERRIDE="$state" \
+    bash -c '. "$1"; fm_pid_identity "$2"' _ "$LIB" "$live" 2>/dev/null || true)
+  kill -0 "$live" 2>/dev/null && alive_after=1
+  kill -TERM "$live" 2>/dev/null || true
+  wait "$live" 2>/dev/null || true
+
+  [ -n "$before" ] || fail "pre-disappearance /proc identity was empty"
+  [ "$alive_before" -eq 1 ] || fail "fixture process was not live before /proc disappearance"
+  [ "$alive_after" -eq 1 ] || fail "fixture process did not remain live across simulated /proc disappearance"
+  [ -z "$after" ] || fail "missing per-PID /proc entry produced an unexpected identity: $after"
+  [ ! -s "$ps_log" ] \
+    || fail "per-PID /proc disappearance fell back to ps: $(tr '\n' ';' < "$ps_log")"
+  pass "per-PID /proc disappearance is an identity mismatch without ps fallback"
+)
+
 test_stale_watch_reclaim_publishes_before_clear() {
   local dir state lockdir rc token
   dir=$(make_case stale-watch-publish-before-clear)
@@ -2180,9 +2224,15 @@ if [ "${FM_TEST_ARM_UNBOUND_CYGWIN:-0}" = 1 ]; then
   exit $?
 fi
 
+if [ "${FM_TEST_PROC_IDENTITY_DISAPPEAR:-0}" = 1 ]; then
+  test_proc_identity_disappearance_does_not_switch_to_ps
+  exit $?
+fi
+
 test_singleton_start
 test_pid_identity_is_locale_invariant
 test_proc_pid_identity_ignores_wall_clock_and_detects_pid_reuse
+test_proc_identity_disappearance_does_not_switch_to_ps
 test_msys_pid_identity_uses_proc
 test_stale_watch_lock_reclaimed
 test_stale_watch_reclaim_publishes_before_clear

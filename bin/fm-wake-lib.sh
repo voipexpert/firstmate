@@ -27,6 +27,16 @@ fm_pid_alive() {
   kill -0 "$pid" 2>/dev/null
 }
 
+# Process identity must choose one platform facility before it inspects a PID.
+# Linux and Git Bash/MSYS expose a compatible /proc root, where a missing
+# per-PID entry means the process disappeared or no longer matches. Only hosts
+# without that facility use the portable ps fallback. Tests disable /proc by
+# pointing FM_PROC_ROOT_OVERRIDE at an absent path.
+fm_proc_pid_facility_available() {
+  local proc_root=${FM_PROC_ROOT_OVERRIDE:-/proc}
+  [ -d "$proc_root" ]
+}
+
 fm_pid_identity() {
   local pid=$1 out proc_root stat_line starttime cmdline_hex identity_key
   local -a stat_fields
@@ -40,7 +50,8 @@ fm_pid_identity() {
   # full NUL-separated cmdline keeps PID reuse a mismatch even on a tick collision.
   # Git Bash/MSYS exposes these compatible files but its Cygwin ps rejects the
   # portable fallback's -o fields, so capability detection must not key on uname.
-  if [ -r "$proc_root/$pid/stat" ] && [ -r "$proc_root/$pid/cmdline" ]; then
+  if fm_proc_pid_facility_available; then
+    [ -r "$proc_root/$pid/stat" ] && [ -r "$proc_root/$pid/cmdline" ] || return 1
     stat_line=$(cat "$proc_root/$pid/stat" 2>/dev/null) || return 1
     # After the final comm delimiter, array index 19 is proc stat field 22.
     read -r -a stat_fields <<< "${stat_line##*)}"
