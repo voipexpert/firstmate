@@ -453,14 +453,119 @@ fi
 # wake exit propagates out so the harness re-notifies firstmate.
 child=
 child_out=
+child_lifetime_identity=
+child_startup_binding_ready=0
+child_startup_identity_active=0
+arm_pending_signal=
+arm_pending_rc=
+
+# The full process identity intentionally includes argv so ordinary PID reuse and
+# executable replacement are mismatches. A just-forked direct child has one
+# legitimate argv transition when it execs the watcher, while its kernel start
+# identity remains stable. Read that immutable lifetime key independently of
+# cmdline: a transient full-identity failure must never make the signal handler
+# forget a child it has already spawned. Keep the narrower key only until the
+# watcher publishes its full lock identity; the stable cycle continues to use
+# the existing full identity afterward.
+child_lifetime_identity_for_pid() {
+  local pid=$1 proc_root stat_line starttime identity_key out
+  local day month date_part time_part year rest
+  local -a stat_fields
+  case "$pid" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  proc_root=${FM_PROC_ROOT_OVERRIDE:-/proc}
+  if [ -r "$proc_root/$pid/stat" ]; then
+    stat_line=$(cat "$proc_root/$pid/stat" 2>/dev/null) || return 1
+    read -r -a stat_fields <<< "${stat_line##*)}"
+    [ "${#stat_fields[@]}" -ge 20 ] || return 1
+    starttime=${stat_fields[19]}
+    case "$starttime" in
+      ''|*[!0-9]*) return 1 ;;
+    esac
+    identity_key=proc-starttime
+    [ "$_FM_UNAME" != Linux ] || identity_key=linux-starttime
+    printf '%s=%s\n' "$identity_key" "$starttime"
+    return 0
+  fi
+  out=$(LC_ALL=C ps -p "$pid" -o lstart= 2>/dev/null) || return 1
+  read -r day month date_part time_part year rest <<< "$out"
+  [ -n "$day" ] && [ -n "$month" ] && [ -n "$date_part" ] \
+    && [ -n "$time_part" ] && [ -n "$year" ] || return 1
+  printf 'ps-lstart=%s|%s|%s|%s|%s\n' \
+    "$day" "$month" "$date_part" "$time_part" "$year"
+}
+
+bind_spawned_child_identity() {
+  local attempts=0
+  child_initial_identity=
+  child_lifetime_identity=
+  while [ "$attempts" -lt 50 ]; do
+    child_lifetime_identity=$(child_lifetime_identity_for_pid "$child" 2>/dev/null || true)
+    if [ -n "$child_lifetime_identity" ]; then
+      child_initial_identity=$(fm_pid_identity "$child" 2>/dev/null || true)
+      return 0
+    fi
+    fm_pid_alive "$child" || return 1
+    sleep 0.02
+    attempts=$((attempts + 1))
+  done
+  return 2
+}
+
 # shellcheck disable=SC2329 # Invoked by the signal-handler path below.
 owned_child_identity_matches() {
-  local current
+  local current current_lifetime current_parent
   [ -n "$child" ] || return 1
   [ "$child" = "$cycle_watcher_pid" ] || return 1
-  [ -n "$cycle_watcher_identity" ] && [ "$cycle_watcher_identity" != none ] || return 1
-  current=$(fm_pid_identity "$child" 2>/dev/null) || return 1
-  [ "$current" = "$cycle_watcher_identity" ]
+  current=$(fm_pid_identity "$child" 2>/dev/null || true)
+  if [ -n "$current" ] && [ "$current" = "$cycle_watcher_identity" ]; then
+    return 0
+  fi
+  [ "$child_startup_identity_active" -eq 1 ] || return 1
+  [ -n "$child_lifetime_identity" ] || return 1
+  current_lifetime=$(child_lifetime_identity_for_pid "$child" 2>/dev/null) || return 1
+  [ "$current_lifetime" = "$child_lifetime_identity" ] || return 1
+  current_parent=$(ps -p "$child" -o ppid= 2>/dev/null | tr -d '[:space:]')
+  [ "$current_parent" = "$ARM_PID" ] || return 1
+  # Bind the lifecycle row and all following full-identity checks to the
+  # post-exec identity just proven to be the same direct child lifetime.
+  [ -z "$current" ] || cycle_watcher_identity=$current
+  return 0
+}
+
+# A live child whose immutable lifetime cannot be read must not be published as
+# signal-ready. This path is only the immediate post-spawn failure boundary: the
+# arm has not launched any other child, so matching PPID proves which exact job
+# may be signalled without falling back to a broad process pattern.
+terminate_unbound_spawned_child() {
+  local signal=$1 limit=$2 i=0 current_parent child_state
+  while [ "$i" -lt "$limit" ]; do
+    if ! fm_pid_alive "$child"; then
+      wait "$child" 2>/dev/null || true
+      child=
+      return 0
+    fi
+    child_state=$(ps -p "$child" -o stat= 2>/dev/null | tr -d '[:space:]')
+    case "$child_state" in
+      Z*)
+        wait "$child" 2>/dev/null || true
+        child=
+        return 0
+        ;;
+    esac
+    current_parent=$(ps -p "$child" -o ppid= 2>/dev/null | tr -d '[:space:]')
+    [ "$current_parent" = "$ARM_PID" ] || return 1
+    if [ "$i" -eq 0 ]; then
+      kill -CONT "$child" 2>/dev/null || true
+      current_parent=$(ps -p "$child" -o ppid= 2>/dev/null | tr -d '[:space:]')
+      [ "$current_parent" = "$ARM_PID" ] || return 1
+      kill -"$signal" "$child" 2>/dev/null || true
+    fi
+    sleep 0.1
+    i=$((i + 1))
+  done
+  return 1
 }
 
 # Poll before calling wait: Bash 3.2 has no timed wait, and wait itself is the
@@ -503,6 +608,13 @@ cleanup_child() {
 # shellcheck disable=SC2329 # Invoked indirectly by the signal traps below.
 handle_arm_signal() {
   local signal=$1 rc=$2 wait_rc=0
+  if [ "$child_startup_binding_ready" -eq 0 ]; then
+    if [ -z "$arm_pending_signal" ]; then
+      arm_pending_signal=$signal
+      arm_pending_rc=$rc
+    fi
+    return 0
+  fi
   trap - HUP TERM INT
   if owned_child_identity_matches; then
     kill -CONT "$child" 2>/dev/null || true
@@ -537,7 +649,37 @@ else
   "$WATCH" >"$child_out" &
 fi
 child=$!
-cycle_begin "$child" started "$(fm_pid_identity "$child" 2>/dev/null || true)"
+bind_rc=0
+bind_spawned_child_identity || bind_rc=$?
+if [ "$bind_rc" -eq 2 ]; then
+  cycle_begin "$child" started none
+  if ! terminate_unbound_spawned_child TERM "$ARM_SHUTDOWN_TERM_GRACE_POLLS"; then
+    terminate_unbound_spawned_child KILL "$ARM_SHUTDOWN_KILL_GRACE_POLLS" || true
+  fi
+  child=
+  cleanup_child
+  if [ -n "$arm_pending_signal" ]; then
+    pending_signal=$arm_pending_signal
+    pending_rc=$arm_pending_rc
+    trap - HUP TERM INT
+    cycle_log_append "$pending_rc" "$pending_signal" arm-interrupted none
+    exit "$pending_rc"
+  fi
+  trap - HUP TERM INT
+  cycle_log_append 1 none startup-identity-bind-failed none
+  echo "watcher: FAILED - spawned watcher identity could not be bound"
+  exit 1
+fi
+cycle_begin "$child" started "${child_initial_identity:-none}"
+child_startup_identity_active=1
+child_startup_binding_ready=1
+if [ -n "$arm_pending_signal" ]; then
+  pending_signal=$arm_pending_signal
+  pending_rc=$arm_pending_rc
+  arm_pending_signal=
+  arm_pending_rc=
+  handle_arm_signal "$pending_signal" "$pending_rc"
+fi
 child_done=0
 
 owned_child_finished() {
@@ -603,6 +745,7 @@ while :; do
   if healthy_watcher; then
     if [ "$HEALTHY_PID" = "$child" ]; then
       cycle_refresh_lock_before
+      child_startup_identity_active=0
       if ! handling_generation=$(handling_successor_generation); then
         cleanup_child
         wait "$child" 2>/dev/null || true

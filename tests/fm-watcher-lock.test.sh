@@ -113,6 +113,30 @@ cleanup_arm_hup_probe() {
   return "$cleanup_rc"
 }
 
+cleanup_arm_preconfirmation_probe() {
+  local cleanup_rc=0 current_identity
+  trap - EXIT INT TERM
+  [ "${arm_cleanup_active:-0}" = 1 ] || return 0
+  if [ -z "${child_pid:-}" ] && [ -n "${ready:-}" ]; then
+    child_pid=$(sed -n 's/^child_pid=//p' "$ready" 2>/dev/null || true)
+  fi
+  current_identity=$(fm_test_pid_identity "${child_pid:-}" 2>/dev/null || true)
+  [ -z "$current_identity" ] || child_identity=$current_identity
+  cleanup_identity_bound_arm_pair \
+    "${armpid:-}" "${arm_identity:-}" "${child_pid:-}" "${child_identity:-}" 1 \
+    || cleanup_rc=$?
+  if test_pid_matches_identity "${sentinel_pid:-}" "${sentinel_identity:-}"; then
+    kill -TERM "$sentinel_pid" 2>/dev/null || true
+    wait "$sentinel_pid" 2>/dev/null || true
+  fi
+  if [ -n "${dir:-}" ] && [ -n "${TMP_ROOT:-}" ] \
+    && [ "${dir#"$TMP_ROOT"/}" != "$dir" ]; then
+    rm -rf -- "$dir"
+  fi
+  arm_cleanup_active=0
+  return "$cleanup_rc"
+}
+
 test_singleton_start() {
   local dir state fakebin out1 out2 pid1 pid2 live i
   dir=$(make_case singleton)
@@ -971,6 +995,389 @@ SH
   pass "arm cleans child watcher and temp output on HUP"
 )
 
+test_arm_preconfirmation_signal_reaps_exact_spawned_child() (
+  local dir state fakebin armout armerr ready release claim exec_ready exec_release stable_ready
+  local real_bash real_cat real_od real_ps real_sleep launch_cmdline_hex stable_identity stable_cmdline_hex
+  local armpid arm_identity child_pid child_parent child_identity od_pid status i
+  local child_survived=0 od_survived=0 sentinel_pid sentinel_identity sentinel_untouched=0
+  local lifecycle_row arm_cleanup_active startup_signal expected_status
+  local -a arm_command
+  dir=$(make_case arm-preconfirmation-hup)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  armout="$dir/arm.out"
+  armerr="$dir/arm.err"
+  ready="$dir/preconfirmation.ready"
+  release="$dir/preconfirmation.release"
+  claim="$dir/preconfirmation.claim"
+  exec_ready="$dir/watcher-pre-exec.ready"
+  exec_release="$dir/watcher-pre-exec.release"
+  stable_ready="$dir/watcher-post-exec.ready"
+  real_bash=$(command -v bash)
+  real_cat=$(command -v cat)
+  real_od=$(command -v od)
+  real_ps=$(command -v ps)
+  real_sleep=$(command -v sleep)
+  mark_pr_check_migration_complete "$state"
+  arm_cleanup_active=0
+  child_pid=
+  child_identity=
+  sentinel_pid=
+  sentinel_identity=
+  startup_signal=${FM_TEST_ARM_PRECONFIRMATION_SIGNAL:-HUP}
+  case "$startup_signal" in
+    HUP) expected_status=129 ;;
+    TERM) expected_status=143 ;;
+    INT) expected_status=130 ;;
+    *) fail "invalid pre-confirmation signal '$startup_signal'" ;;
+  esac
+
+  # Keep the exact watcher PID in a pre-exec shell until the parent has sampled
+  # that mutable argv identity. The test later releases this wrapper and waits
+  # for the real watcher lock before allowing the pending HUP trap to run, which
+  # proves the startup ownership binding survives the legitimate exec change.
+  cat > "$fakebin/bash" <<'SH'
+#!/bin/sh
+set -u
+if [ "${1:-}" = "${FM_TEST_WATCH_PATH:?FM_TEST_WATCH_PATH unset}" ]; then
+  tmp="${FM_TEST_WATCH_EXEC_READY:?FM_TEST_WATCH_EXEC_READY unset}.$$"
+  printf '%s\n' "$$" > "$tmp"
+  mv -f "$tmp" "$FM_TEST_WATCH_EXEC_READY"
+  while [ ! -e "${FM_TEST_WATCH_EXEC_RELEASE:?FM_TEST_WATCH_EXEC_RELEASE unset}" ]; do
+    "${FM_TEST_REAL_SLEEP:?FM_TEST_REAL_SLEEP unset}" 0.02
+  done
+fi
+exec "${FM_TEST_REAL_BASH:?FM_TEST_REAL_BASH unset}" "$@"
+SH
+  chmod +x "$fakebin/bash"
+
+  # Hold only the arm parent's identity read after it has emitted the real
+  # cmdline bytes. HUP is therefore pending after the watcher spawn and $!
+  # assignment, but before cycle_begin can publish the child's identity. The
+  # watcher's own identity read has the target as its caller's parent and is not
+  # delayed, so this is an exact startup-boundary synchronization rather than a
+  # timing guess.
+  cat > "$fakebin/od" <<'SH'
+#!/usr/bin/env bash
+set -u
+last=
+for arg in "$@"; do last=$arg; done
+case "$last" in
+  /proc/[0-9]*/cmdline)
+    target=${last%/cmdline}
+    target=${target##*/}
+    caller_parent=$("${FM_TEST_REAL_PS:?FM_TEST_REAL_PS unset}" -p "$PPID" -o ppid= 2>/dev/null | tr -d '[:space:]')
+    arm_pid=$("$FM_TEST_REAL_PS" -p "$caller_parent" -o ppid= 2>/dev/null | tr -d '[:space:]')
+    if [ "$arm_pid" != "$target" ] \
+      && ( set -C; : > "${FM_TEST_PRECONFIRM_CLAIM:?FM_TEST_PRECONFIRM_CLAIM unset}" ) 2>/dev/null; then
+      captured=$("${FM_TEST_REAL_OD:?FM_TEST_REAL_OD unset}" "$@" | tr -d '[:space:]')
+      printf '%s\n' "$captured"
+      tmp="${FM_TEST_PRECONFIRM_READY:?FM_TEST_PRECONFIRM_READY unset}.$$"
+      {
+        printf 'arm_pid=%s\n' "$arm_pid"
+        printf 'child_pid=%s\n' "$target"
+        printf 'od_pid=%s\n' "$$"
+        printf 'launch_cmdline_hex=%s\n' "$captured"
+      } > "$tmp"
+      mv -f "$tmp" "$FM_TEST_PRECONFIRM_READY"
+      if [ -n "${FM_TEST_PRECONFIRM_SELF_SIGNAL:-}" ]; then
+        kill -"$FM_TEST_PRECONFIRM_SELF_SIGNAL" "$arm_pid"
+        : > "${FM_TEST_WATCH_EXEC_RELEASE:?FM_TEST_WATCH_EXEC_RELEASE unset}"
+        i=0
+        while [ "$i" -lt 400 ]; do
+          lock_pid=$("${FM_TEST_REAL_CAT:?FM_TEST_REAL_CAT unset}" \
+            "${FM_TEST_STATE:?FM_TEST_STATE unset}/.watch.lock/pid" 2>/dev/null || true)
+          [ "$lock_pid" = "$target" ] && [ -e "$FM_TEST_STATE/.last-watcher-beat" ] && break
+          "${FM_TEST_REAL_SLEEP:?FM_TEST_REAL_SLEEP unset}" 0.02
+          i=$((i + 1))
+        done
+        [ "$lock_pid" = "$target" ] && [ -e "$FM_TEST_STATE/.last-watcher-beat" ] || exit 91
+        stable=$("$FM_TEST_REAL_OD" "$@" | tr -d '[:space:]')
+        tmp="${FM_TEST_STABLE_READY:?FM_TEST_STABLE_READY unset}.$$"
+        printf '%s\n' "$stable" > "$tmp"
+        mv -f "$tmp" "$FM_TEST_STABLE_READY"
+        exit 0
+      fi
+      while [ ! -e "${FM_TEST_PRECONFIRM_RELEASE:?FM_TEST_PRECONFIRM_RELEASE unset}" ]; do
+        "${FM_TEST_REAL_SLEEP:?FM_TEST_REAL_SLEEP unset}" 0.02
+      done
+      exit 0
+    fi
+    ;;
+esac
+exec "${FM_TEST_REAL_OD:?FM_TEST_REAL_OD unset}" "$@"
+SH
+  chmod +x "$fakebin/od"
+
+  arm_cleanup_active=1
+  trap 'cleanup_arm_preconfirmation_probe' EXIT
+
+  "$real_sleep" 60 &
+  sentinel_pid=$!
+  sentinel_identity=$(fm_test_pid_identity "$sentinel_pid" 2>/dev/null || true)
+  [ -n "$sentinel_identity" ] || fail "could not bind pre-confirmation unrelated sentinel"
+
+  arm_command=(
+    env "PATH=$fakebin:$PATH" "FM_HOME=$dir" "FM_STATE_OVERRIDE=$state"
+    "FM_POLL=30" "FM_SIGNAL_GRACE=1" "FM_CHECK_INTERVAL=999999" "FM_HEARTBEAT=999999"
+    "FM_TEST_REAL_BASH=$real_bash" "FM_TEST_REAL_CAT=$real_cat" "FM_TEST_REAL_OD=$real_od"
+    "FM_TEST_REAL_PS=$real_ps" "FM_TEST_REAL_SLEEP=$real_sleep" "FM_TEST_STATE=$state"
+    "FM_TEST_WATCH_PATH=$WATCH" "FM_TEST_WATCH_EXEC_READY=$exec_ready"
+    "FM_TEST_WATCH_EXEC_RELEASE=$exec_release" "FM_TEST_PRECONFIRM_CLAIM=$claim"
+    "FM_TEST_PRECONFIRM_READY=$ready" "FM_TEST_PRECONFIRM_RELEASE=$release"
+    "FM_TEST_STABLE_READY=$stable_ready" "$real_bash" "$WATCH_ARM"
+  )
+  if [ "$startup_signal" = INT ]; then
+    FM_TEST_PRECONFIRM_SELF_SIGNAL=INT "${arm_command[@]}" > "$armout" 2> "$armerr"
+    status=$?
+    armpid=$(sed -n 's/^arm_pid=//p' "$ready" 2>/dev/null || true)
+    arm_identity=
+  else
+    "${arm_command[@]}" > "$armout" 2> "$armerr" &
+    armpid=$!
+    arm_identity=$(fm_test_pid_identity "$armpid" 2>/dev/null || true)
+    [ -n "$arm_identity" ] || fail "could not bind pre-confirmation arm identity"
+  fi
+
+  i=0
+  while [ "$i" -lt 160 ] && [ ! -s "$ready" ]; do
+    "$real_sleep" 0.05
+    i=$((i + 1))
+  done
+  [ -s "$ready" ] || fail "arm did not enter the synchronized pre-confirmation identity window"
+  [ -n "$armpid" ] || armpid=$(sed -n 's/^arm_pid=//p' "$ready")
+  child_pid=$(sed -n 's/^child_pid=//p' "$ready")
+  od_pid=$(sed -n 's/^od_pid=//p' "$ready")
+  launch_cmdline_hex=$(sed -n 's/^launch_cmdline_hex=//p' "$ready")
+  case "$child_pid:$od_pid" in
+    *[!0-9:]*|:*) fail "pre-confirmation synchronization published invalid process identities" ;;
+  esac
+  [ -n "$launch_cmdline_hex" ] \
+    || fail "pre-confirmation synchronization did not capture the launch argv identity"
+  i=0
+  while [ "$i" -lt 160 ] && [ "$(cat "$exec_ready" 2>/dev/null || true)" != "$child_pid" ]; do
+    "$real_sleep" 0.05
+    i=$((i + 1))
+  done
+  [ "$(cat "$exec_ready" 2>/dev/null || true)" = "$child_pid" ] \
+    || fail "watcher child did not enter the synchronized pre-exec window"
+  if [ "$startup_signal" = INT ]; then
+    child_parent=$(sed -n 's/^arm_pid=//p' "$ready")
+    stable_cmdline_hex=$(cat "$stable_ready" 2>/dev/null || true)
+  else
+    child_parent=$("$real_ps" -p "$child_pid" -o ppid= 2>/dev/null | tr -d '[:space:]')
+    kill -"$startup_signal" "$armpid" 2>/dev/null \
+      || fail "could not interrupt arm with $startup_signal during pre-confirmation"
+    : > "$exec_release"
+    i=0
+    while [ "$i" -lt 160 ]; do
+      [ "$(cat "$state/.watch.lock/pid" 2>/dev/null || true)" = "$child_pid" ] \
+        && [ -e "$state/.last-watcher-beat" ] && break
+      "$real_sleep" 0.05
+      i=$((i + 1))
+    done
+    [ "$(cat "$state/.watch.lock/pid" 2>/dev/null || true)" = "$child_pid" ] \
+      && [ -e "$state/.last-watcher-beat" ] \
+      || fail "watcher did not complete the synchronized exec transition"
+    stable_identity=$(fm_test_pid_identity "$child_pid" 2>/dev/null || true)
+    stable_cmdline_hex=${stable_identity#*cmdline-hex=}
+    [ -n "$stable_identity" ] && [ "$stable_cmdline_hex" != "$stable_identity" ] \
+      || fail "could not bind the post-exec watcher identity"
+    : > "$release"
+    wait_for_exit "$armpid" 160
+    status=$?
+  fi
+  [ "$child_parent" = "$armpid" ] \
+    || fail "synchronized watcher was not the arm's exact direct child"
+  [ -n "$stable_cmdline_hex" ] \
+    || fail "could not bind the post-exec watcher identity"
+  [ "$stable_cmdline_hex" != "$launch_cmdline_hex" ] \
+    || fail "pre-confirmation fixture did not force an argv identity transition"
+
+  is_live_non_zombie "$child_pid" && child_survived=1
+  is_live_non_zombie "$od_pid" && od_survived=1
+  test_pid_matches_identity "$sentinel_pid" "$sentinel_identity" && sentinel_untouched=1
+  lifecycle_row=$(tail -1 "$state/.watch-cycle-exits.log" 2>/dev/null || true)
+  child_identity=$(fm_test_pid_identity "$child_pid" 2>/dev/null || true)
+
+  # RED containment remains exact-PID/exact-identity. It runs before assertions
+  # so the intentionally failing original implementation cannot leak the child.
+  cleanup_identity_bound_arm_pair \
+    "$armpid" "$arm_identity" "$child_pid" "$child_identity" 0 \
+    || fail "pre-confirmation RED containment could not retire its exact processes"
+  if test_pid_matches_identity "$sentinel_pid" "$sentinel_identity"; then
+    kill -TERM "$sentinel_pid" 2>/dev/null || true
+    wait "$sentinel_pid" 2>/dev/null || true
+  fi
+  sentinel_pid=
+  sentinel_identity=
+  arm_cleanup_active=0
+  trap - EXIT
+
+  [ "$status" -eq "$expected_status" ] \
+    || fail "pre-confirmation $startup_signal returned $status instead of $expected_status"
+  [ "$child_survived" -eq 0 ] \
+    || fail "pre-confirmation $startup_signal forgot the newly spawned watcher child"
+  [ "$od_survived" -eq 0 ] \
+    || fail "pre-confirmation $startup_signal left its identity-output process running"
+  [ "$sentinel_untouched" -eq 1 ] \
+    || fail "pre-confirmation $startup_signal signalled an unrelated process"
+  ! ls "$state"/.watch-arm-output.* >/dev/null 2>&1 \
+    || fail "pre-confirmation $startup_signal left temp output behind"
+  case "$lifecycle_row" in
+    "arm_pid=$armpid"$'\t'"watcher_pid=$child_pid"$'\t'*$'\t'"exit_code=$expected_status"$'\t'"signal=$startup_signal"$'\t'"reason=arm-interrupted"$'\t'*) ;;
+    *) fail "pre-confirmation $startup_signal did not retain the exact child lifecycle row: $lifecycle_row" ;;
+  esac
+  pass "pre-confirmation $startup_signal reaps only the exact newly spawned watcher"
+)
+
+test_arm_preconfirmation_signals_reap_exact_spawned_child() {
+  local startup_signal log rc
+  for startup_signal in HUP TERM INT; do
+    log="$TMP_ROOT/arm-preconfirmation-$startup_signal.log"
+    rc=0
+    FM_TEST_ARM_PRECONFIRMATION_HUP=1 FM_TEST_ARM_PRECONFIRMATION_SIGNAL="$startup_signal" \
+      bash "$0" > "$log" 2>&1 || rc=$?
+    if [ "$rc" -ne 0 ]; then
+      cat "$log" >&2
+      fail "pre-confirmation $startup_signal probe exited $rc"
+    fi
+    grep -F "ok - pre-confirmation $startup_signal reaps only the exact newly spawned watcher" "$log" >/dev/null \
+      || fail "pre-confirmation $startup_signal probe did not complete its behavior contract"
+  done
+  pass "pre-confirmation HUP, TERM, and INT reap only the exact newly spawned watcher"
+}
+
+test_arm_signal_reaps_child_when_full_identity_is_unavailable() (
+  local dir state fakebin armout armerr ready fail_log real_od real_ps real_sleep
+  local armpid arm_identity child_pid child_identity child_parent sentinel_pid sentinel_identity
+  local status i lifecycle_row arm_cleanup_active child_survived=0 sentinel_untouched=0
+  dir=$(make_case arm-identity-unavailable)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  armout="$dir/arm.out"
+  armerr="$dir/arm.err"
+  ready="$dir/identity-failure.ready"
+  fail_log="$dir/identity-failure.log"
+  real_od=$(command -v od)
+  real_ps=$(command -v ps)
+  real_sleep=$(command -v sleep)
+  mark_pr_check_migration_complete "$state"
+  arm_cleanup_active=0
+  child_pid=
+  child_identity=
+  sentinel_pid=
+  sentinel_identity=
+
+  # Reject every full cmdline identity read made by the arm while allowing the
+  # exact watcher to identify itself and establish its real lock normally. A
+  # target PID in the od process's ancestor chain is a self-read; a sibling
+  # target is the arm inspecting its child.
+  cat > "$fakebin/od" <<'SH'
+#!/usr/bin/env bash
+set -u
+last=
+for arg in "$@"; do last=$arg; done
+case "$last" in
+  /proc/[0-9]*/cmdline)
+    target=${last%/cmdline}
+    target=${target##*/}
+    ancestor=$PPID
+    self_read=0
+    while [ "$ancestor" -gt 1 ]; do
+      if [ "$ancestor" = "$target" ]; then
+        self_read=1
+        break
+      fi
+      ancestor=$("${FM_TEST_REAL_PS:?FM_TEST_REAL_PS unset}" -p "$ancestor" -o ppid= 2>/dev/null | tr -d '[:space:]')
+      case "$ancestor" in ''|*[!0-9]*) break ;; esac
+    done
+    if [ "$self_read" -eq 0 ]; then
+      tmp="${FM_TEST_IDENTITY_FAILURE_READY:?FM_TEST_IDENTITY_FAILURE_READY unset}.$$"
+      printf 'child_pid=%s\n' "$target" > "$tmp"
+      mv -f "$tmp" "$FM_TEST_IDENTITY_FAILURE_READY"
+      printf 'arm-full-identity-failed child_pid=%s\n' "$target" \
+        >> "${FM_TEST_IDENTITY_FAILURE_LOG:?FM_TEST_IDENTITY_FAILURE_LOG unset}"
+      exit 1
+    fi
+    ;;
+esac
+exec "${FM_TEST_REAL_OD:?FM_TEST_REAL_OD unset}" "$@"
+SH
+  chmod +x "$fakebin/od"
+
+  PATH="$fakebin:$PATH" FM_HOME="$dir" FM_STATE_OVERRIDE="$state" \
+    FM_POLL=2 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 \
+    FM_TEST_REAL_OD="$real_od" FM_TEST_REAL_PS="$real_ps" \
+    FM_TEST_IDENTITY_FAILURE_READY="$ready" FM_TEST_IDENTITY_FAILURE_LOG="$fail_log" \
+    "$WATCH_ARM" > "$armout" 2> "$armerr" &
+  armpid=$!
+  arm_identity=$(fm_test_pid_identity "$armpid" 2>/dev/null || true)
+  [ -n "$arm_identity" ] || fail "could not bind identity-unavailable arm"
+  arm_cleanup_active=1
+  trap 'cleanup_arm_preconfirmation_probe' EXIT
+
+  i=0
+  while [ "$i" -lt 160 ] && [ ! -s "$ready" ]; do
+    "$real_sleep" 0.05
+    i=$((i + 1))
+  done
+  [ -s "$ready" ] || fail "arm did not enter the deterministic full-identity failure path"
+  child_pid=$(sed -n 's/^child_pid=//p' "$ready")
+  case "$child_pid" in ''|*[!0-9]*) fail "identity failure published an invalid child PID" ;; esac
+
+  i=0
+  while [ "$i" -lt 160 ]; do
+    [ "$(cat "$state/.watch.lock/pid" 2>/dev/null || true)" = "$child_pid" ] \
+      && [ -e "$state/.last-watcher-beat" ] && break
+    "$real_sleep" 0.05
+    i=$((i + 1))
+  done
+  [ "$(cat "$state/.watch.lock/pid" 2>/dev/null || true)" = "$child_pid" ] \
+    && [ -e "$state/.last-watcher-beat" ] \
+    || fail "watcher did not establish normally while arm identity reads failed"
+  [ -s "$fail_log" ] || fail "full-identity failure seam did not reject an arm read"
+  child_parent=$("$real_ps" -p "$child_pid" -o ppid= 2>/dev/null | tr -d '[:space:]')
+  [ "$child_parent" = "$armpid" ] || fail "identity-unavailable watcher was not the exact direct child"
+  child_identity=$(fm_test_pid_identity "$child_pid" 2>/dev/null || true)
+  [ -n "$child_identity" ] || fail "test could not bind the identity-unavailable watcher for containment"
+
+  "$real_sleep" 60 &
+  sentinel_pid=$!
+  sentinel_identity=$(fm_test_pid_identity "$sentinel_pid" 2>/dev/null || true)
+  [ -n "$sentinel_identity" ] || fail "could not bind identity-unavailable sentinel"
+
+  kill -HUP "$armpid" 2>/dev/null || fail "could not interrupt identity-unavailable arm"
+  wait_for_exit "$armpid" 160
+  status=$?
+  is_live_non_zombie "$child_pid" && child_survived=1
+  test_pid_matches_identity "$sentinel_pid" "$sentinel_identity" && sentinel_untouched=1
+  lifecycle_row=$(tail -1 "$state/.watch-cycle-exits.log" 2>/dev/null || true)
+
+  cleanup_identity_bound_arm_pair \
+    "$armpid" "$arm_identity" "$child_pid" "$child_identity" 0 \
+    || fail "identity-unavailable RED containment could not retire its exact processes"
+  if test_pid_matches_identity "$sentinel_pid" "$sentinel_identity"; then
+    kill -TERM "$sentinel_pid" 2>/dev/null || true
+    wait "$sentinel_pid" 2>/dev/null || true
+  fi
+  sentinel_pid=
+  sentinel_identity=
+  arm_cleanup_active=0
+  trap - EXIT
+
+  [ "$status" -eq 129 ] || fail "identity-unavailable HUP returned $status instead of 129"
+  [ "$child_survived" -eq 0 ] || fail "identity-unavailable HUP forgot the live watcher child"
+  [ "$sentinel_untouched" -eq 1 ] || fail "identity-unavailable HUP signalled an unrelated process"
+  ! ls "$state"/.watch-arm-output.* >/dev/null 2>&1 \
+    || fail "identity-unavailable HUP left temp output behind"
+  case "$lifecycle_row" in
+    "arm_pid=$armpid"$'\t'"watcher_pid=$child_pid"$'\t'*$'\t'"exit_code=129"$'\t'"signal=HUP"$'\t'"reason=arm-interrupted"$'\t'*) ;;
+    *) fail "identity-unavailable HUP did not retain the exact lifecycle row: $lifecycle_row" ;;
+  esac
+  pass "HUP reaps the exact child when arm full-identity reads are unavailable"
+)
+
 test_arm_hup_ignores_ambient_grace_and_cleans_foreground() {
   local hostile log rc
   for hostile in 1 999999; do
@@ -1453,6 +1860,16 @@ if [ "${FM_TEST_FORCE_ARM_HUP_TERM:-0}" = 1 ]; then
   exit $?
 fi
 
+if [ "${FM_TEST_ARM_PRECONFIRMATION_HUP:-0}" = 1 ]; then
+  test_arm_preconfirmation_signal_reaps_exact_spawned_child
+  exit $?
+fi
+
+if [ "${FM_TEST_ARM_IDENTITY_UNAVAILABLE:-0}" = 1 ]; then
+  test_arm_signal_reaps_child_when_full_identity_is_unavailable
+  exit $?
+fi
+
 test_singleton_start
 test_pid_identity_is_locale_invariant
 test_proc_pid_identity_ignores_wall_clock_and_detects_pid_reuse
@@ -1477,6 +1894,8 @@ test_arm_attaches_and_waits_for_live_fresh_watcher
 test_attached_arm_signal_is_recorded_in_cycle_ledger
 test_arm_starts_and_self_heals
 test_arm_hup_scoped_cleanup_on_forced_term
+test_arm_preconfirmation_signals_reap_exact_spawned_child
+test_arm_signal_reaps_child_when_full_identity_is_unavailable
 test_arm_hup_preserves_caller_traps
 test_arm_hup_ignores_ambient_grace_and_cleans_foreground
 test_arm_propagates_immediate_wake_before_confirmation
