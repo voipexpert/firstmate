@@ -782,8 +782,8 @@ test_arm_starts_and_self_heals() {
 test_arm_hup_cleans_child_and_temp_output() (
   local dir state fakebin armout poll_ready real_sleep stale_generation delayed_generation fresh_generation
   local evidence_dir arm_identity lock_identity i armpid lock_pid status arm_exit_polls stopped_mode
-  local watcher_parent watcher_state fresh_sleep_pid fresh_sleep_identity fresh_sleep_parent
-  local sentinel_pid sentinel_identity lifecycle_row
+  local watcher_parent watcher_state stopped_generation fresh_sleep_pid fresh_sleep_identity fresh_sleep_parent
+  local sentinel_pid sentinel_identity lifecycle_row poll_seconds
   local arm_cleanup_active
   dir=$(make_case arm-hup-cleanup)
   state="$dir/state"
@@ -793,6 +793,8 @@ test_arm_hup_cleans_child_and_temp_output() (
   real_sleep=$(command -v sleep)
   arm_exit_polls=${FM_TEST_ARM_HUP_EXIT_POLLS:-$ARM_FAIL_EXIT_POLLS}
   stopped_mode=${FM_TEST_ARM_HUP_STOPPED_CHILD:-0}
+  poll_seconds=10
+  [ "$stopped_mode" != 1 ] || poll_seconds=2
   arm_cleanup_active=0
   lock_pid=
   lock_identity=
@@ -808,13 +810,32 @@ if [ "${1:-}" = "${FM_TEST_BLOCKING_SLEEP_SECONDS:-}" ]; then
   tmp="$ready.$$"
   printf '%s\n' "$$" > "$tmp"
   mv -f "$tmp" "$ready"
+  if [ "${FM_TEST_PARENT_RUNNING_SLEEP:-0}" = 1 ]; then
+    required=${FM_TEST_PARENT_RUNNING_SLEEP_TICKS:-15}
+    remaining=$required
+    while [ "$remaining" -gt 0 ]; do
+      parent_state=$(ps -p "$PPID" -o stat= 2>/dev/null | tr -d '[:space:]')
+      case "$parent_state" in
+        T*)
+          stopped_tmp="$ready.stopped.$$"
+          printf '%s\n' "$$" > "$stopped_tmp"
+          mv -f "$stopped_tmp" "$ready.stopped"
+          remaining=$required
+          ;;
+        *) remaining=$((remaining - 1)) ;;
+      esac
+      "${FM_TEST_REAL_SLEEP:?FM_TEST_REAL_SLEEP unset}" 0.1
+    done
+    exit 0
+  fi
 fi
 exec "${FM_TEST_REAL_SLEEP:?FM_TEST_REAL_SLEEP unset}" "$@"
 SH
   chmod +x "$fakebin/sleep"
   PATH="$fakebin:$PATH" FM_HOME="$dir" FM_STATE_OVERRIDE="$state" \
-    FM_POLL=10 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 \
-    FM_TEST_BLOCKING_SLEEP_SECONDS=10 FM_TEST_BLOCKING_SLEEP_READY="$poll_ready" \
+    FM_POLL="$poll_seconds" FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 \
+    FM_TEST_BLOCKING_SLEEP_SECONDS="$poll_seconds" FM_TEST_BLOCKING_SLEEP_READY="$poll_ready" \
+    FM_TEST_PARENT_RUNNING_SLEEP="$stopped_mode" FM_TEST_PARENT_RUNNING_SLEEP_TICKS=15 \
     FM_TEST_REAL_SLEEP="$real_sleep" "$WATCH_ARM" > "$armout" &
   armpid=$!
   arm_identity=$(fm_test_pid_identity "$armpid" 2>/dev/null || true)
@@ -897,17 +918,19 @@ SH
     sentinel_pid=$!
     sentinel_identity=$(fm_test_pid_identity "$sentinel_pid" 2>/dev/null || true)
     [ -n "$sentinel_identity" ] || fail "could not bind unrelated sentinel identity"
+    rm -f "$poll_ready.stopped"
     kill -STOP "$lock_pid" 2>/dev/null || fail "could not stop exact owned watcher before HUP"
     i=0
     while [ "$i" -lt 20 ]; do
       watcher_state=$(ps -p "$lock_pid" -o stat= 2>/dev/null | tr -d '[:space:]')
-      case "$watcher_state" in T*) break ;; esac
+      stopped_generation=$(cat "$poll_ready.stopped" 2>/dev/null || true)
+      case "$watcher_state:$stopped_generation" in T*:"$fresh_sleep_pid") break ;; esac
       sleep 0.1
       i=$((i + 1))
     done
-    case "$watcher_state" in
-      T*) ;;
-      *) fail "exact owned watcher did not enter the stopped state before HUP" ;;
+    case "$watcher_state:$stopped_generation" in
+      T*:"$fresh_sleep_pid") ;;
+      *) fail "exact watcher and foreground command did not synchronize in the stopped state before HUP" ;;
     esac
   fi
   kill -HUP "$armpid" 2>/dev/null || fail "could not send HUP to arm"
@@ -927,22 +950,19 @@ SH
   if [ "$stopped_mode" = 1 ]; then
     test_pid_matches_identity "$sentinel_pid" "$sentinel_identity" \
       || fail "bounded arm shutdown signalled an unrelated process"
+    ! test_pid_matches_identity "$fresh_sleep_pid" "$fresh_sleep_identity" \
+      || fail "bounded arm shutdown left the watcher's foreground command running"
     lifecycle_row=$(tail -1 "$state/.watch-cycle-exits.log" 2>/dev/null || true)
     case "$lifecycle_row" in
       "arm_pid=$armpid"$'\t'"watcher_pid=$lock_pid"$'\t'*$'\t'"exit_code=129"$'\t'"signal=HUP"$'\t'"reason=arm-interrupted"$'\t'*) ;;
       *) fail "bounded stopped-watcher shutdown did not preserve the HUP lifecycle row: $lifecycle_row" ;;
     esac
-    [ "$(cat "$state/.watch.lock/pid" 2>/dev/null || true)" = "$lock_pid" ] \
-      || fail "escalated shutdown discarded recoverable stale-lock pid evidence"
-    [ "$(cat "$state/.watch.lock/pid-identity" 2>/dev/null || true)" = "$lock_identity" ] \
-      || fail "escalated shutdown discarded recoverable stale-lock identity evidence"
+    [ ! -e "$state/.watch.lock" ] && [ ! -L "$state/.watch.lock" ] \
+      || fail "graceful stopped-watcher shutdown left stale lock evidence"
     kill -TERM "$sentinel_pid" 2>/dev/null || true
     wait "$sentinel_pid" 2>/dev/null || true
     sentinel_pid=
     sentinel_identity=
-    if test_pid_matches_identity "$fresh_sleep_pid" "$fresh_sleep_identity"; then
-      kill -TERM "$fresh_sleep_pid" 2>/dev/null || true
-    fi
     fresh_sleep_pid=
     fresh_sleep_identity=
   fi
@@ -951,18 +971,21 @@ SH
   pass "arm cleans child watcher and temp output on HUP"
 )
 
-test_arm_hup_bounds_stopped_owned_child() {
-  local log rc=0
-  log="$TMP_ROOT/arm-hup-stopped-child.log"
-  FM_TEST_ARM_HUP_STOPPED_CHILD=1 FM_TEST_ARM_HUP_EXIT_POLLS=30 \
-    FM_ARM_SHUTDOWN_GRACE_POLLS=2 bash "$0" > "$log" 2>&1 || rc=$?
-  if [ "$rc" -ne 0 ]; then
-    cat "$log" >&2
-    fail "arm did not bound HUP shutdown of its stopped identity-bound watcher (status $rc)"
-  fi
-  grep -F 'ok - arm cleans child watcher and temp output on HUP' "$log" >/dev/null \
-    || fail "stopped-watcher shutdown probe did not complete its behavior contract"
-  pass "arm bounds HUP shutdown of a stopped identity-bound watcher without collateral signaling"
+test_arm_hup_ignores_ambient_grace_and_cleans_foreground() {
+  local hostile log rc
+  for hostile in 1 999999; do
+    log="$TMP_ROOT/arm-hup-hostile-grace-$hostile.log"
+    rc=0
+    FM_TEST_ARM_HUP_STOPPED_CHILD=1 FM_TEST_ARM_HUP_EXIT_POLLS=80 \
+      FM_ARM_SHUTDOWN_GRACE_POLLS="$hostile" bash "$0" > "$log" 2>&1 || rc=$?
+    if [ "$rc" -ne 0 ]; then
+      cat "$log" >&2
+      fail "ambient shutdown grace '$hostile' changed bounded stopped-watcher cleanup (status $rc)"
+    fi
+    grep -F 'ok - arm cleans child watcher and temp output on HUP' "$log" >/dev/null \
+      || fail "hostile-grace '$hostile' probe did not complete its behavior contract"
+  done
+  pass "arm ignores ambient grace and cleans a stopped watcher's foreground command without collateral signaling"
 }
 
 test_arm_hup_preserves_caller_traps() {
@@ -1455,7 +1478,7 @@ test_attached_arm_signal_is_recorded_in_cycle_ledger
 test_arm_starts_and_self_heals
 test_arm_hup_scoped_cleanup_on_forced_term
 test_arm_hup_preserves_caller_traps
-test_arm_hup_bounds_stopped_owned_child
+test_arm_hup_ignores_ambient_grace_and_cleans_foreground
 test_arm_propagates_immediate_wake_before_confirmation
 test_arm_waits_for_peer_beacon_after_child_stands_down
 test_arm_fails_loud_when_no_fresh_watcher_confirmable

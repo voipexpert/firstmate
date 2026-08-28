@@ -79,13 +79,11 @@ esac
 CONFIRM_TIMEOUT=${FM_ARM_CONFIRM_TIMEOUT:-$ARM_CONFIRM_DEFAULT}
 # Poll interval while attached to an existing healthy watcher.
 ATTACH_POLL=${FM_ARM_ATTACH_POLL:-0.5}
-# Signal shutdown gives the exact owned watcher a short graceful interval before
-# escalating. Both the TERM and post-KILL waits use 0.1-second polls; the test
-# seam stays numeric and bounded on Bash 3.2 platforms.
-ARM_SHUTDOWN_GRACE_POLLS=${FM_ARM_SHUTDOWN_GRACE_POLLS:-50}
-case "$ARM_SHUTDOWN_GRACE_POLLS" in
-  ''|*[!0-9]*|0) ARM_SHUTDOWN_GRACE_POLLS=50 ;;
-esac
+# Signal shutdown uses fixed production bounds so ambient configuration cannot
+# weaken the graceful interval or turn either 0.1-second poll loop into a
+# practical hang.
+ARM_SHUTDOWN_TERM_GRACE_POLLS=50
+ARM_SHUTDOWN_KILL_GRACE_POLLS=50
 CYCLE_LOG="$STATE/.watch-cycle-exits.log"
 CYCLE_LOG_LOCK="$STATE/.watch-cycle-exits.lock"
 CYCLE_LOG_MAX_BYTES=${FM_WATCH_CYCLE_LOG_MAX_BYTES:-262144}
@@ -471,8 +469,8 @@ owned_child_identity_matches() {
 # deadline, and 2 when the pid can no longer be proven to be that child.
 # shellcheck disable=SC2329 # Invoked by the signal-handler path below.
 wait_owned_child_bounded() {
-  local i=0 child_state
-  while [ "$i" -lt "$ARM_SHUTDOWN_GRACE_POLLS" ]; do
+  local limit=$1 i=0 child_state
+  while [ "$i" -lt "$limit" ]; do
     if ! fm_pid_alive "$child"; then
       wait "$child" 2>/dev/null || true
       child=
@@ -507,14 +505,14 @@ handle_arm_signal() {
   local signal=$1 rc=$2 wait_rc=0
   trap - HUP TERM INT
   if owned_child_identity_matches; then
-    kill -TERM "$child" 2>/dev/null || true
-    wait_owned_child_bounded || wait_rc=$?
-    if [ "$wait_rc" -eq 1 ] && owned_child_identity_matches; then
-      kill -CONT "$child" 2>/dev/null || true
-      if owned_child_identity_matches; then
+    kill -CONT "$child" 2>/dev/null || true
+    if owned_child_identity_matches; then
+      kill -TERM "$child" 2>/dev/null || true
+      wait_owned_child_bounded "$ARM_SHUTDOWN_TERM_GRACE_POLLS" || wait_rc=$?
+      if [ "$wait_rc" -eq 1 ] && owned_child_identity_matches; then
         kill -KILL "$child" 2>/dev/null || true
+        wait_owned_child_bounded "$ARM_SHUTDOWN_KILL_GRACE_POLLS" || true
       fi
-      wait_owned_child_bounded || true
     fi
   fi
   cycle_log_append "$rc" "$signal" arm-interrupted none
