@@ -88,17 +88,9 @@ cleanup_identity_bound_arm_pair() {  # <arm-pid> <arm-id> <watcher-pid> <watcher
   return 1
 }
 
-restore_arm_hup_scope_traps() {
-  trap - EXIT INT TERM RETURN
-  [ -z "${arm_prior_exit_trap:-}" ] || eval "$arm_prior_exit_trap"
-  [ -z "${arm_prior_int_trap:-}" ] || eval "$arm_prior_int_trap"
-  [ -z "${arm_prior_term_trap:-}" ] || eval "$arm_prior_term_trap"
-  [ -z "${arm_prior_return_trap:-}" ] || eval "$arm_prior_return_trap"
-}
-
-cleanup_arm_hup_scope() {
+cleanup_arm_hup_probe() {
   local cleanup_rc=0
-  trap - EXIT INT TERM RETURN
+  trap - EXIT INT TERM
   [ "${arm_cleanup_active:-0}" = 1 ] || return 0
   cleanup_identity_bound_arm_pair \
     "${armpid:-}" "${arm_identity:-}" "${lock_pid:-}" "${lock_identity:-}" 1 \
@@ -112,31 +104,6 @@ cleanup_arm_hup_scope() {
   fi
   arm_cleanup_active=0
   return "$cleanup_rc"
-}
-
-arm_hup_scope_exit() {
-  local rc=$?
-  cleanup_arm_hup_scope || true
-  fm_test_cleanup
-  exit "$rc"
-}
-
-arm_hup_scope_signal() {  # <exit-status>
-  local rc=$1
-  cleanup_arm_hup_scope || true
-  fm_test_cleanup
-  exit "$rc"
-}
-
-arm_hup_scope_return() {
-  cleanup_arm_hup_scope || true
-  restore_arm_hup_scope_traps
-}
-
-disarm_arm_hup_scope() {
-  trap - EXIT INT TERM RETURN
-  arm_cleanup_active=0
-  restore_arm_hup_scope_traps
 }
 
 test_singleton_start() {
@@ -805,10 +772,10 @@ test_arm_starts_and_self_heals() {
   pass "arm starts cleanly and resurfaces recovery after a dead-pid lock"
 }
 
-test_arm_hup_cleans_child_and_temp_output() {
+test_arm_hup_cleans_child_and_temp_output() (
   local dir state fakebin armout poll_ready real_sleep stale_generation delayed_generation fresh_generation
   local evidence_dir arm_identity lock_identity i armpid lock_pid status
-  local arm_cleanup_active arm_prior_exit_trap arm_prior_int_trap arm_prior_term_trap arm_prior_return_trap
+  local arm_cleanup_active
   dir=$(make_case arm-hup-cleanup)
   state="$dir/state"
   fakebin="$dir/fakebin"
@@ -818,10 +785,6 @@ test_arm_hup_cleans_child_and_temp_output() {
   arm_cleanup_active=0
   lock_pid=
   lock_identity=
-  arm_prior_exit_trap=$(trap -p EXIT)
-  arm_prior_int_trap=$(trap -p INT)
-  arm_prior_term_trap=$(trap -p TERM)
-  arm_prior_return_trap=$(trap -p RETURN)
   cat > "$fakebin/sleep" <<'SH'
 #!/usr/bin/env bash
 set -u
@@ -846,10 +809,9 @@ SH
     fail "could not bind cleanup to the started arm identity"
   fi
   arm_cleanup_active=1
-  trap 'arm_hup_scope_exit' EXIT
-  trap 'arm_hup_scope_signal 130' INT
-  trap 'arm_hup_scope_signal 143' TERM
-  trap 'arm_hup_scope_return' RETURN
+  trap 'cleanup_arm_hup_probe' EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
   i=0
   while [ "$i" -lt 80 ]; do
     grep -qF 'watcher: started pid=' "$armout" 2>/dev/null && break
@@ -882,7 +844,7 @@ SH
     printf '%s\n' watcher-stopped > "$evidence_dir/stage"
   fi
   if [ "${FM_TEST_FORCE_ARM_HUP_TERM:-0}" = 1 ]; then
-    kill -TERM "$$"
+    bash -c 'kill -TERM "$PPID"'
     fail "forced TERM returned instead of ending the cleanup probe"
   fi
   "$real_sleep" 1 || {
@@ -920,8 +882,42 @@ SH
   done
   ! is_live_non_zombie "$lock_pid" || fail "HUP cleanup left watcher child running"
   ! ls "$state"/.watch-arm-output.* >/dev/null 2>&1 || fail "HUP cleanup left temp output behind"
-  disarm_arm_hup_scope
+  arm_cleanup_active=0
+  trap - EXIT
   pass "arm cleans child watcher and temp output on HUP"
+)
+
+test_arm_hup_preserves_caller_traps() {
+  local dir noop before after after_source probe_rc changed=0
+  dir=$(make_case arm-hup-trap-state)
+  noop="$dir/noop.sh"
+  before="$dir/traps.before"
+  after="$dir/traps.after"
+  after_source="$dir/traps.after-source"
+  printf ':\n' > "$noop"
+
+  trap -p EXIT INT TERM RETURN > "$before"
+  test_arm_hup_cleans_child_and_temp_output
+  probe_rc=$?
+  [ "$probe_rc" -eq 0 ] || fail "normal HUP cleanup probe exited $probe_rc"
+  trap -p EXIT INT TERM RETURN > "$after"
+  # A leaked RETURN handler fires at the end of a sourced file and can erase
+  # inherited test cleanup traps after the HUP fixture itself appeared done.
+  # Source one no-op so both the immediate and deferred trap state are proven.
+  # shellcheck source=/dev/null
+  . "$noop"
+  trap -p EXIT INT TERM RETURN > "$after_source"
+
+  cmp -s "$before" "$after" || changed=1
+  cmp -s "$before" "$after_source" || changed=1
+  if [ "$changed" -ne 0 ]; then
+    printf '%s\n' '--- trap state immediately after normal HUP ---' >&2
+    diff -u "$before" "$after" >&2 || true
+    printf '%s\n' '--- trap state after sourcing a no-op ---' >&2
+    diff -u "$before" "$after_source" >&2 || true
+    fail "normal HUP fixture changed its caller's EXIT/INT/TERM/RETURN traps"
+  fi
+  pass "normal HUP fixture preserves caller traps across a later source return"
 }
 
 test_arm_hup_scoped_cleanup_on_forced_term() {
@@ -1348,7 +1344,7 @@ test_msys_pid_identity_uses_proc() {
 
 if [ "${FM_TEST_FORCE_ARM_HUP_TERM:-0}" = 1 ]; then
   test_arm_hup_cleans_child_and_temp_output
-  exit 0
+  exit $?
 fi
 
 test_singleton_start
@@ -1375,7 +1371,7 @@ test_arm_attaches_and_waits_for_live_fresh_watcher
 test_attached_arm_signal_is_recorded_in_cycle_ledger
 test_arm_starts_and_self_heals
 test_arm_hup_scoped_cleanup_on_forced_term
-test_arm_hup_cleans_child_and_temp_output
+test_arm_hup_preserves_caller_traps
 test_arm_propagates_immediate_wake_before_confirmation
 test_arm_waits_for_peer_beacon_after_child_stands_down
 test_arm_fails_loud_when_no_fresh_watcher_confirmable
