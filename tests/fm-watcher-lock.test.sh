@@ -708,12 +708,26 @@ test_arm_starts_and_self_heals() {
 }
 
 test_arm_hup_cleans_child_and_temp_output() {
-  local dir state fakebin armout i armpid lock_pid status
+  local dir state fakebin armout poll_ready real_sleep i armpid lock_pid status
   dir=$(make_case arm-hup-cleanup)
   state="$dir/state"
   fakebin="$dir/fakebin"
   armout="$dir/arm.out"
-  PATH="$fakebin:$PATH" FM_HOME="$dir" FM_STATE_OVERRIDE="$state" FM_POLL=5 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH_ARM" > "$armout" &
+  poll_ready="$dir/poll-sleep.ready"
+  real_sleep=$(command -v sleep)
+  cat > "$fakebin/sleep" <<'SH'
+#!/usr/bin/env bash
+set -u
+if [ "${1:-}" = "${FM_TEST_BLOCKING_SLEEP_SECONDS:-}" ]; then
+  : > "${FM_TEST_BLOCKING_SLEEP_READY:?FM_TEST_BLOCKING_SLEEP_READY unset}"
+fi
+exec "${FM_TEST_REAL_SLEEP:?FM_TEST_REAL_SLEEP unset}" "$@"
+SH
+  chmod +x "$fakebin/sleep"
+  PATH="$fakebin:$PATH" FM_HOME="$dir" FM_STATE_OVERRIDE="$state" \
+    FM_POLL=10 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 \
+    FM_TEST_BLOCKING_SLEEP_SECONDS=10 FM_TEST_BLOCKING_SLEEP_READY="$poll_ready" \
+    FM_TEST_REAL_SLEEP="$real_sleep" "$WATCH_ARM" > "$armout" &
   armpid=$!
   i=0
   while [ "$i" -lt 80 ]; do
@@ -723,8 +737,17 @@ test_arm_hup_cleans_child_and_temp_output() {
   done
   grep -qF 'watcher: started pid=' "$armout" || fail "arm did not start before HUP cleanup check"
   lock_pid=$(cat "$state/.watch.lock/pid" 2>/dev/null || true)
+  i=0
+  while [ "$i" -lt 80 ] && [ ! -e "$poll_ready" ]; do
+    sleep 0.1
+    i=$((i + 1))
+  done
+  [ -e "$poll_ready" ] || fail "watcher did not enter the synchronized foreground poll sleep"
   kill -HUP "$armpid" 2>/dev/null || fail "could not send HUP to arm"
-  wait_for_exit "$armpid" 80
+  # The arm waits for owned watcher cleanup, and Bash may defer the watcher's
+  # TERM trap until its foreground poll command returns. Use the shared ceiling
+  # that already covers the largest production confirmation budget.
+  wait_for_exit "$armpid" "$ARM_FAIL_EXIT_POLLS"
   status=$?
   [ "$status" -eq 129 ] || fail "arm did not exit with HUP status (got $status)"
   i=0

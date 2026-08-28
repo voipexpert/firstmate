@@ -162,6 +162,22 @@ age_cooldown() {  # <state-dir> <mate-id> <seconds-ago>
   printf '%s\n' "$(( $(date +%s) - $3 ))" > "$1/$2.reconcile-nudged"
 }
 
+make_controlled_date() {  # <fakebin> -> echoes real date path
+  local fakebin=$1 real_date
+  real_date=$(command -v date)
+  cat > "$fakebin/date" <<'SH'
+#!/usr/bin/env bash
+set -u
+if [ "$#" -eq 1 ] && [ "$1" = +%s ]; then
+  printf '%s\n' "${FM_TEST_DATE_EPOCH:?FM_TEST_DATE_EPOCH unset}"
+  exit 0
+fi
+exec "${FM_TEST_REAL_DATE:?FM_TEST_REAL_DATE unset}" "$@"
+SH
+  chmod +x "$fakebin/date"
+  printf '%s\n' "$real_date"
+}
+
 run_notify() {  # <home> <fakebin> <name> <snapshot> [extra args...]
   local home=$1 fakebin=$2 name=$3 snap=$4
   shift 4
@@ -279,18 +295,31 @@ SH
 }
 
 test_the_window_is_four_hours() {
-  local home mate fakebin snap out
+  local home mate fakebin snap out now real_date
   { read -r home; read -r mate; read -r fakebin; } < <(make_main_home fourhours mate)
   snap="$home/snapshot.json"
   write_snapshot "$snap" mate '{"kind":"terminal_in_flight","ids":["done-row"]}'
-  run_notify "$home" "$fakebin" fourhours "$snap" >/dev/null || fail "the first ask failed"
-  # One second short of four hours is still inside; one second past is not.
-  age_cooldown "$home/state" mate 14399
-  out=$(run_notify "$home" "$fakebin" fourhours "$snap")
-  assert_contains "$out" "cooldown: mate" "the window was shorter than four hours: $out"
-  age_cooldown "$home/state" mate 14401
-  out=$(run_notify "$home" "$fakebin" fourhours "$snap")
+  now=2000000000
+  real_date=$(make_controlled_date "$fakebin")
+  FM_TEST_DATE_EPOCH=$now FM_TEST_REAL_DATE=$real_date \
+    run_notify "$home" "$fakebin" fourhours "$snap" >/dev/null || fail "the first ask failed"
+  # Hold marker creation and product sampling to the same clock tick so this
+  # strict boundary cannot cross a wall-clock second between the two reads.
+  PATH="$fakebin:$PATH" FM_TEST_DATE_EPOCH=$now FM_TEST_REAL_DATE=$real_date \
+    age_cooldown "$home/state" mate 14399
+  out=$(FM_TEST_DATE_EPOCH=$now FM_TEST_REAL_DATE=$real_date \
+    run_notify "$home" "$fakebin" fourhours "$snap")
+  assert_contains "$out" "cooldown: mate 14399" "the window was shorter than four hours: $out"
+  [ "$(inbox_records "$home/state" mate)" -eq 1 ] \
+    || fail "the 14399-second boundary sent another instruction"
+
+  PATH="$fakebin:$PATH" FM_TEST_DATE_EPOCH=$now FM_TEST_REAL_DATE=$real_date \
+    age_cooldown "$home/state" mate 14400
+  out=$(FM_TEST_DATE_EPOCH=$now FM_TEST_REAL_DATE=$real_date \
+    run_notify "$home" "$fakebin" fourhours "$snap")
   assert_contains "$out" "sent: mate" "the window was longer than four hours: $out"
+  [ "$(inbox_records "$home/state" mate)" -eq 2 ] \
+    || fail "the 14400-second boundary did not send exactly one more instruction"
   pass "the cooldown window is four hours"
 }
 
