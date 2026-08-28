@@ -541,7 +541,7 @@ fm_remote_job_advance_seq_hint() { # <value>
 }
 
 fm_remote_job_next_seq() { # [stage-dir destination]
-  local stage=${1:-} destination=${2:-} counter value claim attempt=0 recovered=0 maximum entry
+  local stage=${1:-} destination=${2:-} counter value claim lock attempt=0 recovered=0 maximum entry
   [ -n "$FM_REMOTE_JOB_STATE" ] && [ -n "$FM_REMOTE_JOB_SEQ_CLAIMS" ] || return 1
   counter="$FM_REMOTE_JOB_STATE/seq"
   value=$(cat "$counter" 2>/dev/null || true)
@@ -563,8 +563,17 @@ fm_remote_job_next_seq() { # [stage-dir destination]
     attempt=$((attempt + 1))
     value=$((value + 1))
     claim="$FM_REMOTE_JOB_SEQ_CLAIMS/$value"
+    lock="$FM_REMOTE_JOB_SEQ_CLAIMS/.$value.claiming"
+    if ! (umask 077; set -C; : > "$lock") 2>/dev/null; then
+      continue
+    fi
+    chmod 600 "$lock" || { rm -f -- "$lock"; return 1; }
+    if [ -e "$claim" ] || [ -L "$claim" ]; then
+      rm -f -- "$lock"
+      continue
+    fi
     if (umask 077; mkdir "$claim") 2>/dev/null; then
-      chmod 700 "$claim" || return 1
+      chmod 700 "$claim" || { rm -f -- "$lock"; return 1; }
       fm_remote_job_advance_seq_hint "$value" || true
       if [ -n "$stage" ]; then
         if ! fm_remote_job_write_number "$stage" seq "$value" \
@@ -575,9 +584,11 @@ fm_remote_job_next_seq() { # [stage-dir destination]
         fi
         rm -f -- "$destination/.owner-pid" "$destination/.owner-start" || true
       fi
+      rm -f -- "$lock"
       printf '%s\n' "$value"
       return 0
     fi
+    rm -f -- "$lock"
     [ -d "$claim" ] && [ ! -L "$claim" ] || return 1
   done
 }

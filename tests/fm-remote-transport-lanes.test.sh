@@ -148,6 +148,23 @@ assert_absent "$STATE_ROOT/.seq-claims/999997" "an expired sequence claim surviv
 rmdir "$STATE_ROOT/.seq-claims/999999"
 pass "atomic sequence claims remain unique and reap only after expiry"
 
+# A false-success mkdir must not turn an existing durable claim into ownership.
+printf '41\n' > "$STATE_ROOT/seq"
+mkdir "$STATE_ROOT/.seq-claims/42"
+REAL_MKDIR=$(command -v mkdir)
+cat > "$FAKEBIN/mkdir" <<'SH'
+#!/usr/bin/env bash
+if [ "$#" -eq 1 ] && [ "$1" = "$FM_TEST_FALSE_SUCCESS_CLAIM" ]; then
+  "$FM_TEST_REAL_MKDIR" "$1" 2>/dev/null || exit 0
+fi
+exec "$FM_TEST_REAL_MKDIR" "$@"
+SH
+chmod +x "$FAKEBIN/mkdir"
+FALSE_SUCCESS_SEQ=$(PATH="$FAKEBIN:$PATH" FM_TEST_FALSE_SUCCESS_CLAIM="$STATE_ROOT/.seq-claims/42" FM_TEST_REAL_MKDIR="$REAL_MKDIR" fm_remote_job_next_seq) || fail "allocator rejected the false-success fixture"
+[ "$FALSE_SUCCESS_SEQ" != 42 ] || fail "allocator accepted a false-success claim for an existing sequence: $FALSE_SUCCESS_SEQ"
+[ -d "$STATE_ROOT/.seq-claims/$FALSE_SUCCESS_SEQ" ] && [ ! -L "$STATE_ROOT/.seq-claims/$FALSE_SUCCESS_SEQ" ] || fail "allocator emitted a sequence without a durable owned claim: $FALSE_SUCCESS_SEQ"
+pass "false-success mkdir cannot reuse an existing sequence claim"
+
 fm_on() {
   FM_HOME="$LOCAL_HOME" \
   FM_ROOT_OVERRIDE="$REMOTE_ROOT" \
