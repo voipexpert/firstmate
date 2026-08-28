@@ -41,6 +41,104 @@ drain_and_ack() {  # <state>
     --recovery-generation "$generation"
 }
 
+test_pid_matches_identity() {  # <pid> <expected-identity>
+  local pid=$1 expected=$2 current
+  case "$pid" in ''|*[!0-9]*) return 1 ;; esac
+  [ -n "$expected" ] || return 1
+  is_live_non_zombie "$pid" || return 1
+  current=$(fm_test_pid_identity "$pid" 2>/dev/null) || return 1
+  [ "$current" = "$expected" ]
+}
+
+cleanup_identity_bound_arm_pair() {  # <arm-pid> <arm-id> <watcher-pid> <watcher-id> <reap-arm>
+  local arm_pid=$1 arm_identity=$2 watcher_pid=$3 watcher_identity=$4 reap_arm=$5 i
+  if test_pid_matches_identity "$watcher_pid" "$watcher_identity"; then
+    kill -CONT "$watcher_pid" 2>/dev/null || true
+    kill -TERM "$watcher_pid" 2>/dev/null || true
+  fi
+  if test_pid_matches_identity "$arm_pid" "$arm_identity"; then
+    kill -TERM "$arm_pid" 2>/dev/null || true
+  fi
+  i=0
+  while [ "$i" -lt "$ARM_FAIL_EXIT_POLLS" ]; do
+    test_pid_matches_identity "$arm_pid" "$arm_identity" \
+      || test_pid_matches_identity "$watcher_pid" "$watcher_identity" \
+      || break
+    sleep 0.1
+    i=$((i + 1))
+  done
+  if test_pid_matches_identity "$watcher_pid" "$watcher_identity"; then
+    kill -CONT "$watcher_pid" 2>/dev/null || true
+    kill -KILL "$watcher_pid" 2>/dev/null || true
+  fi
+  if test_pid_matches_identity "$arm_pid" "$arm_identity"; then
+    kill -KILL "$arm_pid" 2>/dev/null || true
+  fi
+  if [ "$reap_arm" = 1 ]; then
+    wait "$arm_pid" 2>/dev/null || true
+  fi
+  i=0
+  while [ "$i" -lt 80 ]; do
+    test_pid_matches_identity "$arm_pid" "$arm_identity" \
+      || test_pid_matches_identity "$watcher_pid" "$watcher_identity" \
+      || return 0
+    sleep 0.1
+    i=$((i + 1))
+  done
+  return 1
+}
+
+restore_arm_hup_scope_traps() {
+  trap - EXIT INT TERM RETURN
+  [ -z "${arm_prior_exit_trap:-}" ] || eval "$arm_prior_exit_trap"
+  [ -z "${arm_prior_int_trap:-}" ] || eval "$arm_prior_int_trap"
+  [ -z "${arm_prior_term_trap:-}" ] || eval "$arm_prior_term_trap"
+  [ -z "${arm_prior_return_trap:-}" ] || eval "$arm_prior_return_trap"
+}
+
+cleanup_arm_hup_scope() {
+  local cleanup_rc=0
+  trap - EXIT INT TERM RETURN
+  [ "${arm_cleanup_active:-0}" = 1 ] || return 0
+  cleanup_identity_bound_arm_pair \
+    "${armpid:-}" "${arm_identity:-}" "${lock_pid:-}" "${lock_identity:-}" 1 \
+    || cleanup_rc=$?
+  if [ -n "${evidence_dir:-}" ]; then
+    printf '%s\n' "$cleanup_rc" > "$evidence_dir/cleanup.rc"
+  fi
+  if [ -n "${dir:-}" ] && [ -n "${TMP_ROOT:-}" ] \
+    && [ "${dir#"$TMP_ROOT"/}" != "$dir" ]; then
+    rm -rf -- "$dir"
+  fi
+  arm_cleanup_active=0
+  return "$cleanup_rc"
+}
+
+arm_hup_scope_exit() {
+  local rc=$?
+  cleanup_arm_hup_scope || true
+  fm_test_cleanup
+  exit "$rc"
+}
+
+arm_hup_scope_signal() {  # <exit-status>
+  local rc=$1
+  cleanup_arm_hup_scope || true
+  fm_test_cleanup
+  exit "$rc"
+}
+
+arm_hup_scope_return() {
+  cleanup_arm_hup_scope || true
+  restore_arm_hup_scope_traps
+}
+
+disarm_arm_hup_scope() {
+  trap - EXIT INT TERM RETURN
+  arm_cleanup_active=0
+  restore_arm_hup_scope_traps
+}
+
 test_singleton_start() {
   local dir state fakebin out1 out2 pid1 pid2 live i
   dir=$(make_case singleton)
@@ -709,13 +807,21 @@ test_arm_starts_and_self_heals() {
 
 test_arm_hup_cleans_child_and_temp_output() {
   local dir state fakebin armout poll_ready real_sleep stale_generation delayed_generation fresh_generation
-  local i armpid lock_pid status
+  local evidence_dir arm_identity lock_identity i armpid lock_pid status
+  local arm_cleanup_active arm_prior_exit_trap arm_prior_int_trap arm_prior_term_trap arm_prior_return_trap
   dir=$(make_case arm-hup-cleanup)
   state="$dir/state"
   fakebin="$dir/fakebin"
   armout="$dir/arm.out"
   poll_ready="$dir/poll-sleep.ready"
   real_sleep=$(command -v sleep)
+  arm_cleanup_active=0
+  lock_pid=
+  lock_identity=
+  arm_prior_exit_trap=$(trap -p EXIT)
+  arm_prior_int_trap=$(trap -p INT)
+  arm_prior_term_trap=$(trap -p TERM)
+  arm_prior_return_trap=$(trap -p RETURN)
   cat > "$fakebin/sleep" <<'SH'
 #!/usr/bin/env bash
 set -u
@@ -733,6 +839,17 @@ SH
     FM_TEST_BLOCKING_SLEEP_SECONDS=10 FM_TEST_BLOCKING_SLEEP_READY="$poll_ready" \
     FM_TEST_REAL_SLEEP="$real_sleep" "$WATCH_ARM" > "$armout" &
   armpid=$!
+  arm_identity=$(fm_test_pid_identity "$armpid" 2>/dev/null || true)
+  if [ -z "$arm_identity" ]; then
+    kill -TERM "$armpid" 2>/dev/null || true
+    wait "$armpid" 2>/dev/null || true
+    fail "could not bind cleanup to the started arm identity"
+  fi
+  arm_cleanup_active=1
+  trap 'arm_hup_scope_exit' EXIT
+  trap 'arm_hup_scope_signal 130' INT
+  trap 'arm_hup_scope_signal 143' TERM
+  trap 'arm_hup_scope_return' RETURN
   i=0
   while [ "$i" -lt 80 ]; do
     grep -qF 'watcher: started pid=' "$armout" 2>/dev/null && break
@@ -741,6 +858,17 @@ SH
   done
   grep -qF 'watcher: started pid=' "$armout" || fail "arm did not start before HUP cleanup check"
   lock_pid=$(cat "$state/.watch.lock/pid" 2>/dev/null || true)
+  lock_identity=$(fm_test_pid_identity "$lock_pid" 2>/dev/null || true)
+  [ -n "$lock_identity" ] || fail "could not bind cleanup to the owned watcher identity"
+  evidence_dir=${FM_TEST_ARM_HUP_CLEANUP_EVIDENCE:-}
+  if [ -n "$evidence_dir" ]; then
+    mkdir -p "$evidence_dir"
+    printf '%s\n' "$armpid" > "$evidence_dir/arm.pid"
+    printf '%s\n' "$arm_identity" > "$evidence_dir/arm.identity"
+    printf '%s\n' "$lock_pid" > "$evidence_dir/watcher.pid"
+    printf '%s\n' "$lock_identity" > "$evidence_dir/watcher.identity"
+    printf '%s\n' "$dir" > "$evidence_dir/fixture-dir"
+  fi
   i=0
   while [ "$i" -lt 80 ] && [ ! -e "$poll_ready" ]; do
     sleep 0.1
@@ -750,6 +878,13 @@ SH
   stale_generation=$(cat "$poll_ready")
   [ -n "$stale_generation" ] || fail "watcher published an empty foreground-sleep generation"
   kill -STOP "$lock_pid" 2>/dev/null || fail "could not pause watcher for delayed readiness counterfactual"
+  if [ -n "$evidence_dir" ]; then
+    printf '%s\n' watcher-stopped > "$evidence_dir/stage"
+  fi
+  if [ "${FM_TEST_FORCE_ARM_HUP_TERM:-0}" = 1 ]; then
+    kill -TERM "$$"
+    fail "forced TERM returned instead of ending the cleanup probe"
+  fi
   "$real_sleep" 1 || {
     kill -CONT "$lock_pid" 2>/dev/null || true
     fail "delayed readiness counterfactual could not wait"
@@ -785,7 +920,46 @@ SH
   done
   ! is_live_non_zombie "$lock_pid" || fail "HUP cleanup left watcher child running"
   ! ls "$state"/.watch-arm-output.* >/dev/null 2>&1 || fail "HUP cleanup left temp output behind"
+  disarm_arm_hup_scope
   pass "arm cleans child watcher and temp output on HUP"
+}
+
+test_arm_hup_scoped_cleanup_on_forced_term() {
+  local evidence log rc arm_pid arm_identity watcher_pid watcher_identity fixture_dir stage
+  local cleanup_report arm_was_live=0 watcher_was_live=0 rescue_rc=0 log_size
+  evidence="$TMP_ROOT/arm-hup-forced-term-evidence"
+  log="$TMP_ROOT/arm-hup-forced-term.log"
+  mkdir -p "$evidence"
+  FM_TEST_FORCE_ARM_HUP_TERM=1 FM_TEST_ARM_HUP_CLEANUP_EVIDENCE="$evidence" \
+    bash "$0" > "$log" 2>&1
+  rc=$?
+
+  arm_pid=$(cat "$evidence/arm.pid" 2>/dev/null || true)
+  arm_identity=$(cat "$evidence/arm.identity" 2>/dev/null || true)
+  watcher_pid=$(cat "$evidence/watcher.pid" 2>/dev/null || true)
+  watcher_identity=$(cat "$evidence/watcher.identity" 2>/dev/null || true)
+  fixture_dir=$(cat "$evidence/fixture-dir" 2>/dev/null || true)
+  stage=$(cat "$evidence/stage" 2>/dev/null || true)
+  cleanup_report=$(cat "$evidence/cleanup.rc" 2>/dev/null || true)
+  test_pid_matches_identity "$arm_pid" "$arm_identity" && arm_was_live=1
+  test_pid_matches_identity "$watcher_pid" "$watcher_identity" && watcher_was_live=1
+
+  # RED may leave the exact probe pair alive. Rescue it before asserting so the
+  # archived failure cannot leave a stopped watcher or an unbounded error log.
+  cleanup_identity_bound_arm_pair \
+    "$arm_pid" "$arm_identity" "$watcher_pid" "$watcher_identity" 0 || rescue_rc=$?
+  log_size=$(wc -c < "$log" | tr -d '[:space:]')
+
+  [ "$rescue_rc" -eq 0 ] || fail "forced-TERM probe rescue could not retire its identity-bound processes"
+  [ "$rc" -eq 143 ] || fail "forced-TERM cleanup probe exited $rc instead of 143"
+  [ "$stage" = watcher-stopped ] || fail "forced-TERM cleanup probe did not reach the SIGSTOP window"
+  [ "$cleanup_report" = 0 ] || fail "forced-TERM scoped cleanup reported '$cleanup_report' instead of 0"
+  [ "$arm_was_live" -eq 0 ] || fail "forced-TERM cleanup left the owned arm alive"
+  [ "$watcher_was_live" -eq 0 ] || fail "forced-TERM cleanup left the stopped owned watcher alive"
+  [ -n "$fixture_dir" ] && [ ! -e "$fixture_dir" ] \
+    || fail "forced-TERM cleanup left its owned fixture state"
+  [ "$log_size" -lt 65536 ] || fail "forced-TERM cleanup produced an unbounded error log ($log_size bytes)"
+  pass "forced TERM in the SIGSTOP window reaps only its owned arm and watcher"
 }
 
 test_arm_propagates_immediate_wake_before_confirmation() {
@@ -1172,6 +1346,11 @@ test_msys_pid_identity_uses_proc() {
   pass "MSYS process identity uses compatible /proc fields"
 }
 
+if [ "${FM_TEST_FORCE_ARM_HUP_TERM:-0}" = 1 ]; then
+  test_arm_hup_cleans_child_and_temp_output
+  exit 0
+fi
+
 test_singleton_start
 test_pid_identity_is_locale_invariant
 test_proc_pid_identity_ignores_wall_clock_and_detects_pid_reuse
@@ -1195,6 +1374,7 @@ test_arm_self_eviction_is_loud_without_successor
 test_arm_attaches_and_waits_for_live_fresh_watcher
 test_attached_arm_signal_is_recorded_in_cycle_ledger
 test_arm_starts_and_self_heals
+test_arm_hup_scoped_cleanup_on_forced_term
 test_arm_hup_cleans_child_and_temp_output
 test_arm_propagates_immediate_wake_before_confirmation
 test_arm_waits_for_peer_beacon_after_child_stands_down
