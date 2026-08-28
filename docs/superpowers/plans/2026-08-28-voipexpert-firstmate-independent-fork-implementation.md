@@ -128,6 +128,7 @@ Expected: a clean named-branch worktree tracking `fork/main`; the runtime checko
 
 - Modify through merge resolution: `bin/fm-spawn.sh`
 - Modify through merge resolution: `bin/fm-test-run.sh`
+- Modify: `docs/documentation-audiences.json`
 
 **Interfaces:**
 
@@ -215,7 +216,23 @@ fm-bearings-board-render.test.sh
 
 Retain feature changed-path mappings for `bin/fm-route.sh`, `bin/fm-routing-lib.sh`, `bin/fm-account-lane.sh`, and `bin/fm-dispatch-policy.sh`, plus upstream's `bin/fm-task-inbox-lib.sh` mapping.
 
-- [ ] **Step 4: Prove all conflict markers are gone and run the combined focused contract.**
+- [ ] **Step 4: Classify the fork rollout records and prove the documentation inventory passes.**
+
+Add the following exact classifications to `docs/documentation-audiences.json`:
+
+- `.superpowers/sdd/2026-08-27-firstmate-automatic-subscription-routing-implementation/final-portable-gate.md`: `maintainer-verification`
+- `docs/superpowers/plans/2026-08-28-voipexpert-firstmate-independent-fork-implementation.md`: `maintainer-architecture`
+- `docs/superpowers/specs/2026-08-28-voipexpert-firstmate-independent-fork-design.md`: `maintainer-architecture`
+
+Run:
+
+```bash
+bin/fm-test-run.sh tests/fm-documentation-audiences.test.sh
+```
+
+Expected: every maintained prose surface is classified exactly once without changing the documentation audience schema or exclusions.
+
+- [ ] **Step 5: Prove all conflict markers are gone and run the combined focused contract.**
 
 Run:
 
@@ -229,7 +246,7 @@ bin/fm-test-run.sh --check-coverage
 
 Expected: five focused tests pass, coverage reports every merged test exactly once, and no conflict marker or syntax error remains.
 
-- [ ] **Step 5: Commit the merge without rewriting either parent.**
+- [ ] **Step 6: Commit the merge without rewriting either parent.**
 
 Run:
 
