@@ -24,7 +24,7 @@ let armClose = new WeakMap();
 let armReadiness = new WeakMap();
 let armRecovery = new WeakMap();
 let armFailureIncident = new WeakMap();
-let notifiedFailureIncidents = new WeakSet();
+let failureIncidentDelivery = new WeakMap();
 
 function positiveInteger(name, fallback) {
   const value = Number(process.env[name]);
@@ -181,8 +181,8 @@ function observeArmOutput(stdout, stderr, settleReadiness) {
     return;
   }
   if (combined.split(/\r?\n/).some((line) => /^watcher: FAILED/.test(line))) {
-    setArmStatus("failed");
-    settleReadiness("failed");
+    setArmStatus("failed-unhandled");
+    settleReadiness("failed-unhandled");
   }
 }
 
@@ -251,13 +251,41 @@ function wakePrompt(reason) {
 }
 
 function surfaceFailure(paths, client, sessionID, reason, failureIncident = null) {
-  if (failureIncident) {
-    if (notifiedFailureIncidents.has(failureIncident)) return;
-    notifiedFailureIncidents.add(failureIncident);
+  setArmStatus("failed-unhandled");
+  if (!failureIncident) {
+    return sendPrompt(paths, client, sessionID, wakePrompt(reason)).then(
+      () => {
+        setArmStatus("failed");
+        return true;
+      },
+      () => false,
+    );
   }
-  void sendPrompt(paths, client, sessionID, wakePrompt(reason)).catch(() => {
-    // OpenCode owns delivery errors; continuity restoration never waits on prompting.
+  let delivery = failureIncidentDelivery.get(failureIncident);
+  if (!delivery) {
+    delivery = { delivered: false, inFlight: null };
+    failureIncidentDelivery.set(failureIncident, delivery);
+  }
+  if (delivery.delivered) {
+    setArmStatus("failed");
+    return Promise.resolve(true);
+  }
+  if (delivery.inFlight) return delivery.inFlight;
+  const attempt = sendPrompt(paths, client, sessionID, wakePrompt(reason)).then(
+    () => {
+      delivery.delivered = true;
+      setArmStatus("failed");
+      return true;
+    },
+    () => {
+      setArmStatus("failed-unhandled");
+      return false;
+    },
+  ).finally(() => {
+    if (delivery.inFlight === attempt) delivery.inFlight = null;
   });
+  delivery.inFlight = attempt;
+  return attempt;
 }
 
 function retryDelay(attempt) {
@@ -290,7 +318,8 @@ function restorationFailure(status) {
   if (status === "read-only") {
     return "watcher: FAILED - OpenCode cannot restore continuity because this session no longer owns the lock";
   }
-  return `watcher: FAILED - OpenCode could not verify a ready successor watcher (${status || "idle"})`;
+  const displayStatus = status === "failed-unhandled" ? "failed" : status;
+  return `watcher: FAILED - OpenCode could not verify a ready successor watcher (${displayStatus || "idle"})`;
 }
 
 async function restoreAfterActionableClose(paths, sessionID, client, predecessorArmPid) {
@@ -399,7 +428,7 @@ function spawnArm(paths, sessionID, client, predecessorArmPid = "", failureIncid
     resolveClosed();
     releaseChild();
     const classification = classifyArmClose(stdout, stderr, code, signal);
-    settleReadiness(classification.kind === "actionable" ? "wake" : "failed");
+    settleReadiness(classification.kind === "actionable" ? "wake" : "failed-unhandled");
     const predecessor = String(armChild.pid ?? "");
     if (classification.kind === "actionable") {
       if (restorationInFlight) return;
@@ -436,7 +465,7 @@ function spawnArm(paths, sessionID, client, predecessorArmPid = "", failureIncid
     settled = true;
     resolveClosed();
     releaseChild();
-    settleReadiness("failed");
+    settleReadiness("failed-unhandled");
     if (restorationInFlight) {
       setArmStatus("failed");
       return;
@@ -487,7 +516,13 @@ async function ensureArm(paths, sessionID, client, predecessorArmPid = "", inclu
   if (!armChild) {
     return armAttempt(launchResult.status, null, includeArmChild);
   }
-  return armAttempt(await waitForArmReady(armChild), armChild, includeArmChild);
+  const status = await waitForArmReady(armChild);
+  const activeFailureIncident = armFailureIncident.get(armChild);
+  if (status === "armed" && activeFailureIncident && failureIncidentDelivery.has(activeFailureIncident)) {
+    armFailureIncident.delete(armChild);
+    retryFailures = 0;
+  }
+  return armAttempt(status, armChild, includeArmChild);
 }
 
 export const FmPrimaryWatchArm = async ({ client, directory, worktree }) => {

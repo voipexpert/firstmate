@@ -2871,7 +2871,9 @@ test_opencode_healthy_arm_output_does_not_suppress_guard() {
   cat > "$repo/bin/fm-watch-arm.sh" <<'SH'
 #!/usr/bin/env bash
 printf 'args=%s\n' "$*" >> "${FM_ARM_LOG:?}"
-printf 'watcher: healthy pid=1 (beacon 0s)\n'
+attempt=$(grep -c '^args=' "$FM_ARM_LOG")
+incident=$(( (attempt + 1) / 2 ))
+printf 'watcher: healthy pid=1 (beacon 0s) incident=incident-%s\n' "$incident"
 if [ -n "${FM_TEST_ARM_CLOSE_RELEASE_FILE:-}" ]; then
   wait_count=0
   while [ ! -e "$FM_TEST_ARM_CLOSE_RELEASE_FILE" ] && [ "$wait_count" -lt 250 ]; do
@@ -2894,6 +2896,7 @@ SH
     FM_TEST_ARM_CLOSE_RELEASE_FILE="${FM_TEST_ARM_CLOSE_RELEASE_FILE:-}" \
     FM_TEST_WAIT_FOR_WATCHER_PROMPT="${FM_TEST_WAIT_FOR_WATCHER_PROMPT:-}" \
     FM_TEST_VERIFY_NEW_FAILURE_INCIDENT="${FM_TEST_VERIFY_NEW_FAILURE_INCIDENT:-}" \
+    FM_TEST_DELAYED_FAILURE_PROMPT="${FM_TEST_DELAYED_FAILURE_PROMPT:-}" \
     FM_TEST_EXTRA_PROMPT_KIND="${FM_TEST_EXTRA_PROMPT_KIND:-}" \
     FM_WATCH_REARM_RETRY_BASE_MS="${FM_WATCH_REARM_RETRY_BASE_MS:-}" \
     FM_WATCH_REARM_RETRY_MAX_MS="${FM_WATCH_REARM_RETRY_MAX_MS:-}" \
@@ -2905,29 +2908,37 @@ import { pathToFileURL } from "node:url";
 const armMod = await import(pathToFileURL(process.env.ARM_PLUGIN).href);
 const guardMod = await import(pathToFileURL(process.env.GUARD_PLUGIN).href);
 const promptBodies = [];
-let settledRetryIncidents = 0;
-const retryIncidentWaiters = [];
-const markRetryIncidentSettled = () => {
-  settledRetryIncidents += 1;
-  for (const waiter of retryIncidentWaiters.splice(0)) waiter();
+const promptRecords = [];
+const settledRetryIncidents = new Set();
+const retryIncidentWaiters = new Map();
+const promptIncident = (text) => text.match(/incident=(incident-[0-9]+)/)?.[1] ?? null;
+const markRetryIncidentSettled = (incident) => {
+  if (!incident) throw new Error("terminal watcher prompt omitted its incident identity");
+  settledRetryIncidents.add(incident);
+  for (const waiter of retryIncidentWaiters.get(incident)?.splice(0) ?? []) waiter();
 };
-const waitForRetryIncidentCount = (expected) => {
-  if (settledRetryIncidents >= expected) return Promise.resolve();
+const waitForRetryIncident = (incident) => {
+  if (settledRetryIncidents.has(incident)) return Promise.resolve();
   return new Promise((resolve, reject) => {
     const onProgress = () => {
-      if (settledRetryIncidents < expected) {
-        retryIncidentWaiters.push(onProgress);
+      if (!settledRetryIncidents.has(incident)) {
+        const waiters = retryIncidentWaiters.get(incident) ?? [];
+        waiters.push(onProgress);
+        retryIncidentWaiters.set(incident, waiters);
         return;
       }
       clearTimeout(timer);
       resolve();
     };
     const timer = setTimeout(() => {
-      const index = retryIncidentWaiters.indexOf(onProgress);
-      if (index >= 0) retryIncidentWaiters.splice(index, 1);
-      reject(new Error(`retry lifecycle did not settle at incident ${expected}`));
+      const waiters = retryIncidentWaiters.get(incident) ?? [];
+      const index = waiters.indexOf(onProgress);
+      if (index >= 0) waiters.splice(index, 1);
+      reject(new Error(`retry lifecycle did not settle for ${incident}`));
     }, 2000);
-    retryIncidentWaiters.push(onProgress);
+    const waiters = retryIncidentWaiters.get(incident) ?? [];
+    waiters.push(onProgress);
+    retryIncidentWaiters.set(incident, waiters);
   });
 };
 const classifyPrompt = (text) => {
@@ -2941,17 +2952,22 @@ const promptClassCounts = () => promptBodies.reduce((counts, text) => {
   counts[classifyPrompt(text)] += 1;
   return counts;
 }, { blind: 0, watcherFailure: 0, unrelated: 0 });
+const watcherPromptCount = (incident) => promptRecords.filter((record) =>
+  record.incident === incident && classifyPrompt(record.text) === "watcherFailure"
+).length;
 const client = {
   session: {
     promptAsync: async (request) => {
       const text = request.body.parts[0].text;
       promptBodies.push(text);
+      const incident = promptIncident(text);
+      promptRecords.push({ text, incident });
       if (text.includes("could not restore watcher continuity after 1 retries")) {
-        markRetryIncidentSettled();
+        markRetryIncidentSettled(incident);
       }
       if (text.includes("TURN WOULD END BLIND") && process.env.FM_TEST_WAIT_FOR_WATCHER_PROMPT === "1") {
         writeFileSync(process.env.FM_TEST_ARM_CLOSE_RELEASE_FILE, "release\n");
-        await waitForRetryIncidentCount(1);
+        await waitForRetryIncident("incident-1");
       }
     },
   },
@@ -3029,14 +3045,21 @@ try {
     }
   }
   if (process.env.FM_TEST_VERIFY_NEW_FAILURE_INCIDENT === "1") {
-    const secondIncidentSettled = waitForRetryIncidentCount(2);
+    if (process.env.FM_TEST_DELAYED_FAILURE_PROMPT === "incident-1") {
+      const delayed = promptRecords.find((record) => record.incident === "incident-1" && classifyPrompt(record.text) === "watcherFailure");
+      if (!delayed) throw new Error("missing incident-1 prompt for delayed-duplicate counterfactual");
+      promptBodies.push(delayed.text);
+      promptRecords.push({ ...delayed });
+    }
+    const secondIncidentSettled = waitForRetryIncident("incident-2");
     const status = await globalThis.__firstmateOpenCodeWatchArm.ensureArmed("session-test", client);
     if (status !== "external") {
       throw new Error(`new failure incident did not reach the external-watcher boundary (${status})`);
     }
     await secondIncidentSettled;
     const classes = promptClassCounts();
-    if (promptBodies.length !== 3 || classes.blind !== 1 || classes.watcherFailure !== 2 || classes.unrelated !== 0) {
+    if (promptBodies.length !== 3 || classes.blind !== 1 || classes.watcherFailure !== 2 || classes.unrelated !== 0 ||
+        watcherPromptCount("incident-1") !== 1 || watcherPromptCount("incident-2") !== 1) {
       throw new Error("new failure incident did not notify exactly once");
     }
   }
@@ -3082,6 +3105,275 @@ test_opencode_concurrent_failure_prompt_does_not_mask_guard_delivery() {
   status=$?
   expect_code 0 "$status" "a concurrent watcher failure prompt must not hide an already delivered turn-end guard: $out"
   pass "OpenCode concurrent failure prompt does not mask guard delivery"
+}
+
+test_opencode_new_failure_incident_rejects_delayed_prior_prompt() {
+  local case_root out status
+  case_root="$TMP_ROOT/opencode-delayed-prior-incident"
+  out=$(TMP_ROOT="$case_root" \
+    FM_TEST_ARM_CLOSE_RELEASE_FILE="$case_root/arm-close.release" \
+    FM_TEST_WAIT_FOR_WATCHER_PROMPT=1 \
+    FM_TEST_VERIFY_NEW_FAILURE_INCIDENT=1 \
+    FM_TEST_DELAYED_FAILURE_PROMPT=incident-1 \
+    FM_WATCH_REARM_RETRY_BASE_MS=5 \
+    FM_WATCH_REARM_RETRY_MAX_MS=5 \
+    FM_WATCH_REARM_RETRY_LIMIT=1 \
+    test_opencode_healthy_arm_output_does_not_suppress_guard 2>&1)
+  status=$?
+  expect_code 1 "$status" "a delayed incident-1 failure prompt must not satisfy incident-2: $out"
+  assert_contains "$out" "new failure incident did not notify exactly once" "delayed prior-incident prompt must fail incident-specific cardinality"
+  pass "OpenCode new failure incident rejects a delayed prior-incident prompt"
+}
+
+test_opencode_armed_recovery_starts_a_fresh_failure_incident() {
+  local arm_plugin repo home log initial_release late_release retired armed fresh_release out status
+  arm_plugin="$ROOT/.opencode/plugins/fm-primary-watch-arm.js"
+  repo="$TMP_ROOT/opencode-recovered-incident-root"
+  home="$TMP_ROOT/opencode-recovered-incident-home"
+  log="$TMP_ROOT/opencode-recovered-incident.log"
+  initial_release="$TMP_ROOT/opencode-recovered-incident.initial-release"
+  late_release="$TMP_ROOT/opencode-recovered-incident.late-release"
+  retired="$TMP_ROOT/opencode-recovered-incident.retired"
+  armed="$TMP_ROOT/opencode-recovered-incident.armed"
+  fresh_release="$TMP_ROOT/opencode-recovered-incident.fresh-release"
+  mkdir -p "$repo/bin" "$home/state" "$home/config"
+  git init -q "$repo"
+  : > "$repo/AGENTS.md"
+  : > "$home/state/task.meta"
+  cat > "$repo/bin/fm-watch-arm.sh" <<'SH'
+#!/usr/bin/env bash
+printf 'arm=%s\n' "$$" >> "${FM_ARM_LOG:?}"
+count=$(wc -l < "$FM_ARM_LOG" | tr -d '[:space:]')
+case "$count" in
+  1)
+    printf 'watcher: healthy pid=1 (beacon 0s) incident=incident-1\n'
+    while [ ! -e "$FM_INITIAL_RELEASE_FILE" ]; do sleep 0.01; done
+    ;;
+  2)
+    trap 'printf "retired\n" > "${FM_RETIRE_FILE:?}"' TERM INT
+    printf 'watcher: healthy pid=2 (beacon 0s) incident=incident-1\n'
+    while [ ! -e "$FM_LATE_RELEASE_FILE" ]; do sleep 0.01; done
+    ;;
+  3)
+    printf 'watcher: started pid=%s (beacon fresh) recovery-generation=incident-1-recovered\n' "$$"
+    printf 'armed\n' > "${FM_ARMED_FILE:?}"
+    while [ ! -e "$FM_FRESH_RELEASE_FILE" ]; do sleep 0.01; done
+    printf 'watcher: FAILED - incident=incident-2 recovered arm ended\n'
+    exit 1
+    ;;
+  4|5)
+    printf 'watcher: FAILED - incident=incident-2 retry-%s ended\n' "$count"
+    exit 1
+    ;;
+  *)
+    printf 'watcher: FAILED - unexpected arm=%s\n' "$count"
+    exit 1
+    ;;
+esac
+SH
+  chmod +x "$repo/bin/fm-watch-arm.sh"
+  out=$(ARM_PLUGIN="$arm_plugin" WORKTREE="$repo" FM_HOME="$home" FM_ARM_LOG="$log" \
+    FM_INITIAL_RELEASE_FILE="$initial_release" FM_LATE_RELEASE_FILE="$late_release" \
+    FM_RETIRE_FILE="$retired" FM_ARMED_FILE="$armed" FM_FRESH_RELEASE_FILE="$fresh_release" \
+    FM_WATCH_ARM_RETIRE_TIMEOUT_MS=20 FM_WATCH_REARM_RETRY_BASE_MS=5 \
+    FM_WATCH_REARM_RETRY_MAX_MS=5 FM_WATCH_REARM_RETRY_LIMIT=2 node 2>&1 <<'EOF'
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { pathToFileURL } from "node:url";
+
+const armMod = await import(pathToFileURL(process.env.ARM_PLUGIN).href);
+const promptRecords = [];
+const promptWaiters = new Map();
+const identifyPrompt = (text) => {
+  const explicit = text.match(/incident=(incident-[0-9]+)/)?.[1];
+  if (explicit) return explicit;
+  if (!existsSync(process.env.FM_ARMED_FILE) && text.includes("WATCHER FIRED")) return "incident-1";
+  return null;
+};
+const recordPrompt = (text) => {
+  const incident = identifyPrompt(text);
+  promptRecords.push({ incident, text });
+  for (const resolve of promptWaiters.get(incident)?.splice(0) ?? []) resolve();
+};
+const promptCount = (incident) => promptRecords.filter((record) => record.incident === incident).length;
+const waitFor = async (predicate, message) => {
+  for (let i = 0; i < 500; i += 1) {
+    if (predicate()) return;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error(message);
+};
+const waitForPrompt = (incident) => {
+  if (promptCount(incident) > 0) return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`missing prompt for ${incident}`)), 2500);
+    const done = () => {
+      clearTimeout(timer);
+      resolve();
+    };
+    const waiters = promptWaiters.get(incident) ?? [];
+    waiters.push(done);
+    promptWaiters.set(incident, waiters);
+  });
+};
+const client = { session: { promptAsync: async (request) => recordPrompt(request.body.parts[0].text) } };
+await armMod.FmPrimaryWatchArm({ client, directory: process.env.WORKTREE, worktree: process.env.WORKTREE });
+writeFileSync(`${process.env.FM_HOME}/state/.lock`, `${process.pid}\n`);
+const firstStatus = await globalThis.__firstmateOpenCodeWatchArm.ensureArmed("session-test", client);
+if (firstStatus !== "external") throw new Error(`first incident did not reach external status (${firstStatus})`);
+writeFileSync(process.env.FM_INITIAL_RELEASE_FILE, "release\n");
+await waitFor(() => existsSync(process.env.FM_RETIRE_FILE), "retry arm did not enter bounded retirement");
+await waitForPrompt("incident-1");
+writeFileSync(process.env.FM_LATE_RELEASE_FILE, "release\n");
+await waitFor(() => existsSync(process.env.FM_ARMED_FILE), "late close did not reach an armed recovery");
+const recoveredStatus = await globalThis.__firstmateOpenCodeWatchArm.ensureArmed("session-test", client);
+if (recoveredStatus !== "armed") throw new Error(`successor did not confirm armed recovery (${recoveredStatus})`);
+if (promptCount("incident-1") !== 1) throw new Error(`incident-1 prompt count changed before fresh failure (${promptCount("incident-1")})`);
+writeFileSync(process.env.FM_FRESH_RELEASE_FILE, "release\n");
+await waitForPrompt("incident-2");
+await waitFor(() => readFileSync(process.env.FM_ARM_LOG, "utf8").trim().split("\n").length === 5, "fresh incident did not settle through its bounded retries");
+if (promptCount("incident-1") !== 1 || promptCount("incident-2") !== 1 || promptRecords.length !== 2) {
+  throw new Error(`unexpected incident prompt cardinality: ${JSON.stringify(promptRecords.map(({ incident }) => incident))}`);
+}
+EOF
+  )
+  status=$?
+  expect_code 0 "$status" "an armed recovery must retire incident-1 before a fresh failure: $out"
+  [ -z "$out" ] || fail "OpenCode recovered-incident test printed output: $out"
+  pass "OpenCode armed recovery starts a fresh failure incident"
+}
+
+test_opencode_rejected_failure_prompt_retries_with_guard_fallback() {
+  local arm_plugin guard_plugin repo home log initial_release release_two release_three guard_log out status
+  arm_plugin="$ROOT/.opencode/plugins/fm-primary-watch-arm.js"
+  guard_plugin="$ROOT/.opencode/plugins/fm-primary-turnend-guard.js"
+  repo="$TMP_ROOT/opencode-rejected-delivery-root"
+  home="$TMP_ROOT/opencode-rejected-delivery-home"
+  log="$TMP_ROOT/opencode-rejected-delivery.log"
+  initial_release="$TMP_ROOT/opencode-rejected-delivery.initial-release"
+  release_two="$TMP_ROOT/opencode-rejected-delivery.release-two"
+  release_three="$TMP_ROOT/opencode-rejected-delivery.release-three"
+  guard_log="$TMP_ROOT/opencode-rejected-delivery.guard.log"
+  mkdir -p "$repo/bin" "$home/state" "$home/config"
+  git init -q "$repo"
+  : > "$repo/AGENTS.md"
+  : > "$home/state/task.meta"
+  cat > "$repo/bin/fm-watch-arm.sh" <<'SH'
+#!/usr/bin/env bash
+printf 'arm=%s\n' "$$" >> "${FM_ARM_LOG:?}"
+count=$(wc -l < "$FM_ARM_LOG" | tr -d '[:space:]')
+printf 'watcher: FAILED - incident=delivery-1 arm=%s\n' "$count"
+case "$count" in
+  1)
+    while [ ! -e "$FM_INITIAL_RELEASE_FILE" ]; do sleep 0.01; done
+    ;;
+  2)
+    trap ':' TERM INT
+    while [ ! -e "$FM_RELEASE_TWO_FILE" ]; do sleep 0.01; done
+    ;;
+  3)
+    trap ':' TERM INT
+    while [ ! -e "$FM_RELEASE_THREE_FILE" ]; do sleep 0.01; done
+    ;;
+  *)
+    exit 1
+    ;;
+esac
+exit 1
+SH
+  cat > "$repo/bin/fm-turnend-guard.sh" <<'SH'
+#!/usr/bin/env bash
+cat >/dev/null
+printf 'guard\n' >> "${FM_GUARD_LOG:?}"
+printf 'guard fallback after unconfirmed watcher prompt\n' >&2
+exit 2
+SH
+  chmod +x "$repo/bin/fm-watch-arm.sh" "$repo/bin/fm-turnend-guard.sh"
+  out=$(ARM_PLUGIN="$arm_plugin" GUARD_PLUGIN="$guard_plugin" WORKTREE="$repo" FM_HOME="$home" \
+    FM_ARM_LOG="$log" FM_INITIAL_RELEASE_FILE="$initial_release" FM_RELEASE_TWO_FILE="$release_two" \
+    FM_RELEASE_THREE_FILE="$release_three" FM_GUARD_LOG="$guard_log" \
+    FM_WATCH_ARM_RETIRE_TIMEOUT_MS=20 FM_WATCH_REARM_RETRY_BASE_MS=5 \
+    FM_WATCH_REARM_RETRY_MAX_MS=5 FM_WATCH_REARM_RETRY_LIMIT=2 node 2>&1 <<'EOF'
+import childProcess from "node:child_process";
+import { existsSync, writeFileSync } from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
+import { pathToFileURL } from "node:url";
+
+const originalSpawn = childProcess.spawn;
+let encoderSpawns = 0;
+childProcess.spawn = (command, args, options) => {
+  if (String(command).endsWith("/bin/fm-operational-input.sh")) encoderSpawns += 1;
+  return originalSpawn(command, args, options);
+};
+syncBuiltinESMExports();
+const realSetTimeout = globalThis.setTimeout;
+let retirementTimeouts = 0;
+globalThis.setTimeout = (callback, delay, ...args) => realSetTimeout(() => {
+  if (delay === Number(process.env.FM_WATCH_ARM_RETIRE_TIMEOUT_MS)) retirementTimeouts += 1;
+  callback(...args);
+}, delay);
+const armMod = await import(pathToFileURL(process.env.ARM_PLUGIN).href);
+const guardMod = await import(pathToFileURL(process.env.GUARD_PLUGIN).href);
+let watcherAttempts = 0;
+let watcherSuccesses = 0;
+let blindSuccesses = 0;
+const watcherPromptRecords = [];
+let rejectFirstWatcher = null;
+const firstWatcherDecision = new Promise((_, reject) => { rejectFirstWatcher = reject; });
+const client = {
+  session: {
+    promptAsync: async (request) => {
+      const text = request.body.parts[0].text;
+      if (text.includes("TURN WOULD END BLIND")) {
+        blindSuccesses += 1;
+        return;
+      }
+      if (!text.includes("WATCHER FIRED")) {
+        throw new Error("unexpected prompt classification");
+      }
+      watcherAttempts += 1;
+      watcherPromptRecords.push({ incident: "delivery-1", attempt: watcherAttempts });
+      if (watcherAttempts === 1) {
+        await firstWatcherDecision;
+        return;
+      }
+      watcherSuccesses += 1;
+    },
+  },
+};
+const waitFor = async (predicate, message) => {
+  for (let i = 0; i < 500; i += 1) {
+    if (predicate()) return;
+    await new Promise((resolve) => realSetTimeout(resolve, 10));
+  }
+  throw new Error(message);
+};
+await armMod.FmPrimaryWatchArm({ client, directory: process.env.WORKTREE, worktree: process.env.WORKTREE });
+const guardHooks = await guardMod.FmPrimaryTurnendGuard({ client, directory: process.env.WORKTREE, worktree: process.env.WORKTREE });
+writeFileSync(`${process.env.FM_HOME}/state/.lock`, `${process.pid}\n`);
+const initialStatus = await globalThis.__firstmateOpenCodeWatchArm.ensureArmed("session-test", client);
+if (initialStatus !== "failed-unhandled") throw new Error(`initial failed arm hid unconfirmed delivery (${initialStatus})`);
+writeFileSync(process.env.FM_INITIAL_RELEASE_FILE, "release\n");
+await waitFor(() => watcherAttempts === 1, "first watcher delivery attempt did not start");
+writeFileSync(process.env.FM_RELEASE_TWO_FILE, "release\n");
+await waitFor(() => retirementTimeouts >= 2, "concurrent terminal path did not reach the shared delivery attempt");
+await new Promise((resolve) => setImmediate(resolve));
+if (watcherAttempts !== 1 || encoderSpawns !== 1) {
+  throw new Error(`concurrent paths started duplicate delivery work attempts=${watcherAttempts} encoders=${encoderSpawns}`);
+}
+rejectFirstWatcher(new Error("test-only first delivery rejection"));
+await guardHooks.event({ event: { type: "session.idle", properties: { sessionID: "session-test" } } });
+await waitFor(() => blindSuccesses === 1 && existsSync(process.env.FM_GUARD_LOG), "unconfirmed typed delivery suppressed the blind guard fallback");
+writeFileSync(process.env.FM_RELEASE_THREE_FILE, "release\n");
+await waitFor(() => watcherSuccesses === 1, "rejected incident delivery was not retried by its later terminal path");
+if (watcherAttempts !== 2 || watcherSuccesses !== 1 || blindSuccesses !== 1 || encoderSpawns !== 3) {
+  throw new Error(`unexpected delivery cardinality attempts=${watcherAttempts} watcherSuccesses=${watcherSuccesses} blindSuccesses=${blindSuccesses} encoders=${encoderSpawns} incidents=${watcherPromptRecords.map(({ incident }) => incident).join(",")}`);
+}
+EOF
+  )
+  status=$?
+  expect_code 0 "$status" "a rejected watcher prompt must remain retryable while the blind guard stays available: $out"
+  [ -z "$out" ] || fail "OpenCode rejected-delivery test printed output: $out"
+  pass "OpenCode rejected failure prompt retries with blind guard fallback"
 }
 
 test_opencode_concurrent_prompt_cardinality_rejects_extra_prompts() {
@@ -3144,4 +3436,7 @@ test_opencode_turnend_guard_rejects_non_epipe_stdin_error
 test_opencode_healthy_arm_output_does_not_suppress_guard
 test_opencode_embedded_failure_surfaces_bounded_snapshot
 test_opencode_concurrent_failure_prompt_does_not_mask_guard_delivery
+test_opencode_new_failure_incident_rejects_delayed_prior_prompt
+test_opencode_armed_recovery_starts_a_fresh_failure_incident
+test_opencode_rejected_failure_prompt_retries_with_guard_fallback
 test_opencode_concurrent_prompt_cardinality_rejects_extra_prompts
