@@ -570,6 +570,7 @@ fm_remote_job_next_seq() { # [stage-dir destination]
     chmod 600 "$lock" || { rm -f -- "$lock"; return 1; }
     if [ -e "$claim" ] || [ -L "$claim" ]; then
       rm -f -- "$lock"
+      [ -d "$claim" ] && [ ! -L "$claim" ] || return 1
       continue
     fi
     if (umask 077; mkdir "$claim") 2>/dev/null; then

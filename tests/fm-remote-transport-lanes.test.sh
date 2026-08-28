@@ -165,6 +165,19 @@ FALSE_SUCCESS_SEQ=$(PATH="$FAKEBIN:$PATH" FM_TEST_FALSE_SUCCESS_CLAIM="$STATE_RO
 [ -d "$STATE_ROOT/.seq-claims/$FALSE_SUCCESS_SEQ" ] && [ ! -L "$STATE_ROOT/.seq-claims/$FALSE_SUCCESS_SEQ" ] || fail "allocator emitted a sequence without a durable owned claim: $FALSE_SUCCESS_SEQ"
 pass "false-success mkdir cannot reuse an existing sequence claim"
 
+printf '52\n' > "$STATE_ROOT/seq"
+: > "$STATE_ROOT/.seq-claims/53"
+if fm_remote_job_next_seq > /dev/null; then
+  fail "allocator skipped an unsafe regular-file sequence claim"
+fi
+rm -f -- "$STATE_ROOT/.seq-claims/53"
+printf '62\n' > "$STATE_ROOT/seq"
+ln -s /dev/null "$STATE_ROOT/.seq-claims/63"
+if fm_remote_job_next_seq > /dev/null; then
+  fail "allocator skipped an unsafe symlink sequence claim"
+fi
+rm -f -- "$STATE_ROOT/.seq-claims/63"
+
 fm_on() {
   FM_HOME="$LOCAL_HOME" \
   FM_ROOT_OVERRIDE="$REMOTE_ROOT" \
