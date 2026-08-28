@@ -458,6 +458,9 @@ child_startup_binding_ready=0
 child_startup_identity_active=0
 arm_pending_signal=
 arm_pending_rc=
+CHILD_PROCESS_LIFETIME=
+CHILD_PROCESS_STATE=
+CHILD_PROCESS_PPID=
 
 # The full process identity intentionally includes argv so ordinary PID reuse and
 # executable replacement are mismatches. A just-forked direct child has one
@@ -466,34 +469,60 @@ arm_pending_rc=
 # cmdline: a transient full-identity failure must never make the signal handler
 # forget a child it has already spawned. Keep the narrower key only until the
 # watcher publishes its full lock identity; the stable cycle continues to use
-# the existing full identity afterward.
-child_lifetime_identity_for_pid() {
-  local pid=$1 proc_root stat_line starttime identity_key out
-  local day month date_part time_part year rest
+# the existing full identity afterward. State and parent must come from the same
+# process snapshot: Cygwin ps has no -o support, while its /proc stat layout is
+# compatible and contains all three fields.
+child_process_snapshot_for_pid() {
+  local pid=$1 proc_root stat_line stat_tail starttime identity_key out
+  local day month date_part time_part year process_state process_ppid rest
   local -a stat_fields
+  CHILD_PROCESS_LIFETIME=
+  CHILD_PROCESS_STATE=
+  CHILD_PROCESS_PPID=
   case "$pid" in
     ''|*[!0-9]*) return 1 ;;
   esac
   proc_root=${FM_PROC_ROOT_OVERRIDE:-/proc}
-  if [ -r "$proc_root/$pid/stat" ]; then
+  if [ -d "$proc_root" ]; then
+    [ -r "$proc_root/$pid/stat" ] || return 1
     stat_line=$(cat "$proc_root/$pid/stat" 2>/dev/null) || return 1
-    read -r -a stat_fields <<< "${stat_line##*)}"
+    stat_tail=${stat_line##*)}
+    [ "$stat_tail" != "$stat_line" ] || return 1
+    read -r -a stat_fields <<< "$stat_tail"
     [ "${#stat_fields[@]}" -ge 20 ] || return 1
+    process_state=${stat_fields[0]}
+    process_ppid=${stat_fields[1]}
     starttime=${stat_fields[19]}
+    [ -n "$process_state" ] || return 1
+    case "$process_ppid" in
+      ''|*[!0-9]*) return 1 ;;
+    esac
     case "$starttime" in
       ''|*[!0-9]*) return 1 ;;
     esac
     identity_key=proc-starttime
     [ "$_FM_UNAME" != Linux ] || identity_key=linux-starttime
-    printf '%s=%s\n' "$identity_key" "$starttime"
-    return 0
+    CHILD_PROCESS_LIFETIME="$identity_key=$starttime"
+  else
+    out=$(LC_ALL=C ps -p "$pid" -o lstart= -o stat= -o ppid= 2>/dev/null) || return 1
+    read -r day month date_part time_part year process_state process_ppid rest <<< "$out"
+    [ -n "$day" ] && [ -n "$month" ] && [ -n "$date_part" ] \
+      && [ -n "$time_part" ] && [ -n "$year" ] && [ -n "$process_state" ] \
+      || return 1
+    case "$process_ppid" in
+      ''|*[!0-9]*) return 1 ;;
+    esac
+    [ -z "$rest" ] || return 1
+    CHILD_PROCESS_LIFETIME="ps-lstart=$day|$month|$date_part|$time_part|$year"
   fi
-  out=$(LC_ALL=C ps -p "$pid" -o lstart= 2>/dev/null) || return 1
-  read -r day month date_part time_part year rest <<< "$out"
-  [ -n "$day" ] && [ -n "$month" ] && [ -n "$date_part" ] \
-    && [ -n "$time_part" ] && [ -n "$year" ] || return 1
-  printf 'ps-lstart=%s|%s|%s|%s|%s\n' \
-    "$day" "$month" "$date_part" "$time_part" "$year"
+  CHILD_PROCESS_STATE=$process_state
+  CHILD_PROCESS_PPID=$process_ppid
+  return 0
+}
+
+child_lifetime_identity_for_pid() {
+  child_process_snapshot_for_pid "$1" || return 1
+  printf '%s\n' "$CHILD_PROCESS_LIFETIME"
 }
 
 bind_spawned_child_identity() {
@@ -524,9 +553,10 @@ owned_child_identity_matches() {
   fi
   [ "$child_startup_identity_active" -eq 1 ] || return 1
   [ -n "$child_lifetime_identity" ] || return 1
-  current_lifetime=$(child_lifetime_identity_for_pid "$child" 2>/dev/null) || return 1
+  child_process_snapshot_for_pid "$child" 2>/dev/null || return 1
+  current_lifetime=$CHILD_PROCESS_LIFETIME
+  current_parent=$CHILD_PROCESS_PPID
   [ "$current_lifetime" = "$child_lifetime_identity" ] || return 1
-  current_parent=$(ps -p "$child" -o ppid= 2>/dev/null | tr -d '[:space:]')
   [ "$current_parent" = "$ARM_PID" ] || return 1
   # Bind the lifecycle row and all following full-identity checks to the
   # post-exec identity just proven to be the same direct child lifetime.
@@ -546,7 +576,9 @@ terminate_unbound_spawned_child() {
       child=
       return 0
     fi
-    child_state=$(ps -p "$child" -o stat= 2>/dev/null | tr -d '[:space:]')
+    child_process_snapshot_for_pid "$child" 2>/dev/null || return 1
+    child_state=$CHILD_PROCESS_STATE
+    current_parent=$CHILD_PROCESS_PPID
     case "$child_state" in
       Z*)
         wait "$child" 2>/dev/null || true
@@ -554,11 +586,11 @@ terminate_unbound_spawned_child() {
         return 0
         ;;
     esac
-    current_parent=$(ps -p "$child" -o ppid= 2>/dev/null | tr -d '[:space:]')
     [ "$current_parent" = "$ARM_PID" ] || return 1
     if [ "$i" -eq 0 ]; then
       kill -CONT "$child" 2>/dev/null || true
-      current_parent=$(ps -p "$child" -o ppid= 2>/dev/null | tr -d '[:space:]')
+      child_process_snapshot_for_pid "$child" 2>/dev/null || return 1
+      current_parent=$CHILD_PROCESS_PPID
       [ "$current_parent" = "$ARM_PID" ] || return 1
       kill -"$signal" "$child" 2>/dev/null || true
     fi
@@ -581,7 +613,8 @@ wait_owned_child_bounded() {
       child=
       return 0
     fi
-    child_state=$(ps -p "$child" -o stat= 2>/dev/null | tr -d '[:space:]')
+    child_process_snapshot_for_pid "$child" 2>/dev/null || return 2
+    child_state=$CHILD_PROCESS_STATE
     case "$child_state" in
       Z*)
         wait "$child" 2>/dev/null || true

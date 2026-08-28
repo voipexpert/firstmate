@@ -804,16 +804,17 @@ test_arm_starts_and_self_heals() {
 }
 
 test_arm_hup_cleans_child_and_temp_output() (
-  local dir state fakebin armout poll_ready real_sleep stale_generation delayed_generation fresh_generation
+  local dir state fakebin armout poll_ready real_ps real_sleep stale_generation delayed_generation fresh_generation
   local evidence_dir arm_identity lock_identity i armpid lock_pid status arm_exit_polls stopped_mode
   local watcher_parent watcher_state stopped_generation fresh_sleep_pid fresh_sleep_identity fresh_sleep_parent
-  local sentinel_pid sentinel_identity lifecycle_row poll_seconds
+  local sentinel_pid sentinel_identity lifecycle_row poll_seconds arm_proc_root portable_ps_log
   local arm_cleanup_active
   dir=$(make_case arm-hup-cleanup)
   state="$dir/state"
   fakebin="$dir/fakebin"
   armout="$dir/arm.out"
   poll_ready="$dir/poll-sleep.ready"
+  real_ps=$(command -v ps)
   real_sleep=$(command -v sleep)
   arm_exit_polls=${FM_TEST_ARM_HUP_EXIT_POLLS:-$ARM_FAIL_EXIT_POLLS}
   stopped_mode=${FM_TEST_ARM_HUP_STOPPED_CHILD:-0}
@@ -826,6 +827,8 @@ test_arm_hup_cleans_child_and_temp_output() (
   fresh_sleep_identity=
   sentinel_pid=
   sentinel_identity=
+  arm_proc_root=/proc
+  portable_ps_log="$dir/portable-ps.log"
   cat > "$fakebin/sleep" <<'SH'
 #!/usr/bin/env bash
 set -u
@@ -856,11 +859,34 @@ fi
 exec "${FM_TEST_REAL_SLEEP:?FM_TEST_REAL_SLEEP unset}" "$@"
 SH
   chmod +x "$fakebin/sleep"
+  if [ "${FM_TEST_ARM_PORTABLE_PS:-0}" = 1 ]; then
+    arm_proc_root="$dir/no-proc"
+    cat > "$fakebin/ps" <<'SH'
+#!/usr/bin/env bash
+set -u
+case "$#:${3-}:${4-}:${5-}:${6-}:${7-}:${8-}" in
+  6:-o:lstart=:-o:command=::)
+    printf 'identity LC_ALL=%s\n' "${LC_ALL-<unset>}" >> "${FM_TEST_PORTABLE_PS_LOG:?FM_TEST_PORTABLE_PS_LOG unset}"
+    ;;
+  8:-o:lstart=:-o:stat=:-o:ppid=)
+    printf 'snapshot LC_ALL=%s\n' "${LC_ALL-<unset>}" >> "${FM_TEST_PORTABLE_PS_LOG:?FM_TEST_PORTABLE_PS_LOG unset}"
+    ;;
+  *)
+    printf 'unsupported %s\n' "$*" >> "${FM_TEST_PORTABLE_PS_LOG:?FM_TEST_PORTABLE_PS_LOG unset}"
+    exit 64
+    ;;
+esac
+exec "${FM_TEST_REAL_PS:?FM_TEST_REAL_PS unset}" "$@"
+SH
+    chmod +x "$fakebin/ps"
+  fi
   PATH="$fakebin:$PATH" FM_HOME="$dir" FM_STATE_OVERRIDE="$state" \
+    FM_PROC_ROOT_OVERRIDE="$arm_proc_root" \
     FM_POLL="$poll_seconds" FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 \
     FM_TEST_BLOCKING_SLEEP_SECONDS="$poll_seconds" FM_TEST_BLOCKING_SLEEP_READY="$poll_ready" \
     FM_TEST_PARENT_RUNNING_SLEEP="$stopped_mode" FM_TEST_PARENT_RUNNING_SLEEP_TICKS=15 \
-    FM_TEST_REAL_SLEEP="$real_sleep" "$WATCH_ARM" > "$armout" &
+    FM_TEST_REAL_PS="$real_ps" FM_TEST_REAL_SLEEP="$real_sleep" \
+    FM_TEST_PORTABLE_PS_LOG="$portable_ps_log" "$WATCH_ARM" > "$armout" &
   armpid=$!
   arm_identity=$(fm_test_pid_identity "$armpid" 2>/dev/null || true)
   if [ -z "$arm_identity" ]; then
@@ -992,11 +1018,35 @@ SH
   fi
   arm_cleanup_active=0
   trap - EXIT
+  if [ "${FM_TEST_ARM_PORTABLE_PS:-0}" = 1 ]; then
+    grep -q '^identity LC_ALL=C$' "$portable_ps_log" \
+      || fail "portable watcher path did not read full identity through locale-pinned ps"
+    grep -q '^snapshot LC_ALL=C$' "$portable_ps_log" \
+      || fail "portable watcher path did not read lifetime, state, and PPID through one locale-pinned ps snapshot"
+    ! grep -q '^unsupported ' "$portable_ps_log" \
+      || fail "portable watcher path used an unsupported ps query"
+    pass "no-/proc watcher cleanup uses the macOS-compatible ps snapshot"
+    exit 0
+  fi
   pass "arm cleans child watcher and temp output on HUP"
 )
 
+test_arm_portable_ps_snapshot_cleans_child() {
+  local log rc=0
+  log="$TMP_ROOT/arm-portable-ps.log"
+  FM_TEST_ARM_PORTABLE_PS=1 bash "$0" > "$log" 2>&1 || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    cat "$log" >&2
+    fail "no-/proc portable ps probe exited $rc"
+  fi
+  grep -F 'ok - no-/proc watcher cleanup uses the macOS-compatible ps snapshot' "$log" >/dev/null \
+    || fail "no-/proc portable ps probe did not complete its behavior contract"
+  pass "no-/proc watcher cleanup uses the macOS-compatible ps snapshot"
+}
+
 test_arm_preconfirmation_signal_reaps_exact_spawned_child() (
   local dir state fakebin armout armerr ready release claim exec_ready exec_release stable_ready
+  local cygwin_ps_log proc_stat_log
   local real_bash real_cat real_od real_ps real_sleep launch_cmdline_hex stable_identity stable_cmdline_hex
   local armpid arm_identity child_pid child_parent child_identity od_pid status i
   local child_survived=0 od_survived=0 sentinel_pid sentinel_identity sentinel_untouched=0
@@ -1013,6 +1063,8 @@ test_arm_preconfirmation_signal_reaps_exact_spawned_child() (
   exec_ready="$dir/watcher-pre-exec.ready"
   exec_release="$dir/watcher-pre-exec.release"
   stable_ready="$dir/watcher-post-exec.ready"
+  cygwin_ps_log="$dir/cygwin-ps.log"
+  proc_stat_log="$dir/proc-stat.log"
   real_bash=$(command -v bash)
   real_cat=$(command -v cat)
   real_od=$(command -v od)
@@ -1050,6 +1102,51 @@ fi
 exec "${FM_TEST_REAL_BASH:?FM_TEST_REAL_BASH unset}" "$@"
 SH
   chmod +x "$fakebin/bash"
+
+  if [ "${FM_TEST_ARM_CYGWIN_PS:-0}" = 1 ]; then
+    # Cygwin ps accepts -p but not the portable -o format. Keep test
+    # orchestration on the captured real ps while production sees this shim.
+    cat > "$fakebin/ps" <<'SH'
+#!/usr/bin/env bash
+set -u
+for arg in "$@"; do
+  if [ "$arg" = -o ]; then
+    printf '%s\n' "$*" >> "${FM_TEST_CYGWIN_PS_LOG:?FM_TEST_CYGWIN_PS_LOG unset}"
+    exit 64
+  fi
+done
+exec "${FM_TEST_REAL_PS:?FM_TEST_REAL_PS unset}" "$@"
+SH
+    chmod +x "$fakebin/ps"
+
+    # Preserve real process fields while forcing a comm value with spaces and
+    # a closing parenthesis. The production parser must split after the final
+    # ')' instead of tokenizing the comm field.
+    cat > "$fakebin/cat" <<'SH'
+#!/usr/bin/env bash
+set -u
+last=
+for arg in "$@"; do last=$arg; done
+case "$last" in
+  /proc/[0-9]*/stat)
+    target=${last%/stat}
+    target=${target##*/}
+    line=$("${FM_TEST_REAL_CAT:?FM_TEST_REAL_CAT unset}" "$last") || exit 1
+    printf '%s\n' "$target" >> "${FM_TEST_PROC_STAT_LOG:?FM_TEST_PROC_STAT_LOG unset}"
+    printf '%s (watcher ) with spaces)%s\n' "$target" "${line##*)}"
+    exit 0
+    ;;
+esac
+exec "${FM_TEST_REAL_CAT:?FM_TEST_REAL_CAT unset}" "$@"
+SH
+    chmod +x "$fakebin/cat"
+
+    if FM_TEST_CYGWIN_PS_LOG="$cygwin_ps_log" FM_TEST_REAL_PS="$real_ps" \
+      "$fakebin/ps" -p "$$" -o ppid= >/dev/null 2>&1; then
+      fail "Cygwin-like ps fixture unexpectedly accepted -o"
+    fi
+    : > "$cygwin_ps_log"
+  fi
 
   # Hold only the arm parent's identity read after it has emitted the real
   # cmdline bytes. HUP is therefore pending after the watcher spawn and $!
@@ -1122,6 +1219,7 @@ SH
     "FM_POLL=30" "FM_SIGNAL_GRACE=1" "FM_CHECK_INTERVAL=999999" "FM_HEARTBEAT=999999"
     "FM_TEST_REAL_BASH=$real_bash" "FM_TEST_REAL_CAT=$real_cat" "FM_TEST_REAL_OD=$real_od"
     "FM_TEST_REAL_PS=$real_ps" "FM_TEST_REAL_SLEEP=$real_sleep" "FM_TEST_STATE=$state"
+    "FM_TEST_CYGWIN_PS_LOG=$cygwin_ps_log" "FM_TEST_PROC_STAT_LOG=$proc_stat_log"
     "FM_TEST_WATCH_PATH=$WATCH" "FM_TEST_WATCH_EXEC_READY=$exec_ready"
     "FM_TEST_WATCH_EXEC_RELEASE=$exec_release" "FM_TEST_PRECONFIRM_CLAIM=$claim"
     "FM_TEST_PRECONFIRM_READY=$ready" "FM_TEST_PRECONFIRM_RELEASE=$release"
@@ -1228,6 +1326,12 @@ SH
     "arm_pid=$armpid"$'\t'"watcher_pid=$child_pid"$'\t'*$'\t'"exit_code=$expected_status"$'\t'"signal=$startup_signal"$'\t'"reason=arm-interrupted"$'\t'*) ;;
     *) fail "pre-confirmation $startup_signal did not retain the exact child lifecycle row: $lifecycle_row" ;;
   esac
+  if [ "${FM_TEST_ARM_CYGWIN_PS:-0}" = 1 ]; then
+    grep -Fx "$child_pid" "$proc_stat_log" >/dev/null \
+      || fail "Cygwin-like /proc fixture did not exercise the child stat parser"
+    [ ! -s "$cygwin_ps_log" ] \
+      || fail "Cygwin-like watcher cleanup invoked unsupported ps -o: $(tr '\n' ';' < "$cygwin_ps_log")"
+  fi
   pass "pre-confirmation $startup_signal reaps only the exact newly spawned watcher"
 )
 
@@ -1246,6 +1350,23 @@ test_arm_preconfirmation_signals_reap_exact_spawned_child() {
       || fail "pre-confirmation $startup_signal probe did not complete its behavior contract"
   done
   pass "pre-confirmation HUP, TERM, and INT reap only the exact newly spawned watcher"
+}
+
+test_arm_cygwin_ps_preconfirmation_signals_reap_exact_spawned_child() {
+  local startup_signal log rc
+  for startup_signal in HUP TERM INT; do
+    log="$TMP_ROOT/arm-cygwin-preconfirmation-$startup_signal.log"
+    rc=0
+    FM_TEST_ARM_PRECONFIRMATION_HUP=1 FM_TEST_ARM_PRECONFIRMATION_SIGNAL="$startup_signal" \
+      FM_TEST_ARM_CYGWIN_PS=1 bash "$0" > "$log" 2>&1 || rc=$?
+    if [ "$rc" -ne 0 ]; then
+      cat "$log" >&2
+      fail "Cygwin-like pre-confirmation $startup_signal probe exited $rc"
+    fi
+    grep -F "ok - pre-confirmation $startup_signal reaps only the exact newly spawned watcher" "$log" >/dev/null \
+      || fail "Cygwin-like pre-confirmation $startup_signal probe did not complete its behavior contract"
+  done
+  pass "Cygwin-like HUP, TERM, and INT reap the exact pre-confirmation watcher without ps -o"
 }
 
 test_arm_signal_reaps_child_when_full_identity_is_unavailable() (
@@ -1376,6 +1497,166 @@ SH
     *) fail "identity-unavailable HUP did not retain the exact lifecycle row: $lifecycle_row" ;;
   esac
   pass "HUP reaps the exact child when arm full-identity reads are unavailable"
+)
+
+test_arm_unbound_cleanup_uses_proc_without_ps_o() (
+  local dir state fakebin armout armerr ready bind_count ps_log proc_stat_log
+  local real_cat real_ps real_sleep armpid arm_identity child_pid child_parent child_identity
+  local sentinel_pid sentinel_identity status i lifecycle_row child_survived=0 sentinel_untouched=0
+  local arm_cleanup_active observed_bind_count
+  dir=$(make_case arm-unbound-cygwin)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  armout="$dir/arm.out"
+  armerr="$dir/arm.err"
+  ready="$dir/unbound.ready"
+  bind_count="$dir/bind-count"
+  ps_log="$dir/cygwin-ps.log"
+  proc_stat_log="$dir/proc-stat.log"
+  real_cat=$(command -v cat)
+  real_ps=$(command -v ps)
+  real_sleep=$(command -v sleep)
+  mark_pr_check_migration_complete "$state"
+  printf '0\n' > "$bind_count"
+  arm_cleanup_active=0
+  child_pid=
+  child_identity=
+  sentinel_pid=
+  sentinel_identity=
+
+  cat > "$fakebin/ps" <<'SH'
+#!/usr/bin/env bash
+set -u
+for arg in "$@"; do
+  if [ "$arg" = -o ]; then
+    printf '%s\n' "$*" >> "${FM_TEST_CYGWIN_PS_LOG:?FM_TEST_CYGWIN_PS_LOG unset}"
+    exit 64
+  fi
+done
+exec "${FM_TEST_REAL_PS:?FM_TEST_REAL_PS unset}" "$@"
+SH
+  chmod +x "$fakebin/ps"
+
+  # Make the arm miss all 50 startup lifetime-bind attempts while allowing the
+  # watcher to read its own real /proc identity. The next arm read succeeds, so
+  # cleanup can prove the exact direct child from compatible stat fields even
+  # though Cygwin-like ps rejects every -o query.
+  cat > "$fakebin/cat" <<'SH'
+#!/usr/bin/env bash
+set -u
+last=
+for arg in "$@"; do last=$arg; done
+case "$last" in
+  /proc/[0-9]*/stat)
+    target=${last%/stat}
+    target=${target##*/}
+    ancestor=$PPID
+    self_read=0
+    while [ "$ancestor" -gt 1 ]; do
+      if [ "$ancestor" = "$target" ]; then
+        self_read=1
+        break
+      fi
+      ancestor=$("${FM_TEST_REAL_PS:?FM_TEST_REAL_PS unset}" -p "$ancestor" -o ppid= 2>/dev/null | tr -d '[:space:]')
+      case "$ancestor" in ''|*[!0-9]*) break ;; esac
+    done
+    if [ "$self_read" -eq 0 ]; then
+      count=$("${FM_TEST_REAL_CAT:?FM_TEST_REAL_CAT unset}" \
+        "${FM_TEST_BIND_COUNT:?FM_TEST_BIND_COUNT unset}" 2>/dev/null || printf '0\n')
+      count=$((count + 1))
+      tmp="${FM_TEST_BIND_COUNT}.$$"
+      printf '%s\n' "$count" > "$tmp"
+      mv -f "$tmp" "$FM_TEST_BIND_COUNT"
+      if [ "$count" -le 50 ]; then
+        tmp="${FM_TEST_UNBOUND_READY:?FM_TEST_UNBOUND_READY unset}.$$"
+        printf 'child_pid=%s\n' "$target" > "$tmp"
+        mv -f "$tmp" "$FM_TEST_UNBOUND_READY"
+        exit 1
+      fi
+    fi
+    line=$("${FM_TEST_REAL_CAT:?FM_TEST_REAL_CAT unset}" "$last") || exit 1
+    printf '%s\n' "$target" >> "${FM_TEST_PROC_STAT_LOG:?FM_TEST_PROC_STAT_LOG unset}"
+    printf '%s (watcher ) with spaces)%s\n' "$target" "${line##*)}"
+    exit 0
+    ;;
+esac
+exec "${FM_TEST_REAL_CAT:?FM_TEST_REAL_CAT unset}" "$@"
+SH
+  chmod +x "$fakebin/cat"
+
+  if FM_TEST_CYGWIN_PS_LOG="$ps_log" FM_TEST_REAL_PS="$real_ps" \
+    "$fakebin/ps" -p "$$" -o ppid= >/dev/null 2>&1; then
+    fail "Cygwin-like unbound fixture unexpectedly accepted ps -o"
+  fi
+  : > "$ps_log"
+
+  PATH="$fakebin:$PATH" FM_HOME="$dir" FM_STATE_OVERRIDE="$state" \
+    FM_POLL=1 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 \
+    FM_TEST_REAL_CAT="$real_cat" FM_TEST_REAL_PS="$real_ps" \
+    FM_TEST_BIND_COUNT="$bind_count" FM_TEST_UNBOUND_READY="$ready" \
+    FM_TEST_CYGWIN_PS_LOG="$ps_log" FM_TEST_PROC_STAT_LOG="$proc_stat_log" \
+    "$WATCH_ARM" > "$armout" 2> "$armerr" &
+  armpid=$!
+  arm_identity=$(fm_test_pid_identity "$armpid" 2>/dev/null || true)
+  [ -n "$arm_identity" ] || fail "could not bind Cygwin-like unbound arm identity"
+  arm_cleanup_active=1
+  trap 'cleanup_arm_preconfirmation_probe' EXIT
+
+  i=0
+  while [ "$i" -lt 160 ] && [ ! -s "$ready" ]; do
+    "$real_sleep" 0.05
+    i=$((i + 1))
+  done
+  [ -s "$ready" ] || fail "arm did not enter the deterministic unbound-child path"
+  child_pid=$(sed -n 's/^child_pid=//p' "$ready")
+  case "$child_pid" in ''|*[!0-9]*) fail "unbound fixture published an invalid child PID" ;; esac
+  child_parent=$("$real_ps" -p "$child_pid" -o ppid= 2>/dev/null | tr -d '[:space:]')
+  [ "$child_parent" = "$armpid" ] || fail "unbound watcher was not the arm's exact direct child"
+  child_identity=$(fm_test_pid_identity "$child_pid" 2>/dev/null || true)
+  [ -n "$child_identity" ] || fail "could not bind unbound watcher identity for containment"
+
+  "$real_sleep" 60 &
+  sentinel_pid=$!
+  sentinel_identity=$(fm_test_pid_identity "$sentinel_pid" 2>/dev/null || true)
+  [ -n "$sentinel_identity" ] || fail "could not bind unbound-cleanup sentinel"
+
+  wait_for_exit "$armpid" 200
+  status=$?
+  is_live_non_zombie "$child_pid" && child_survived=1
+  test_pid_matches_identity "$sentinel_pid" "$sentinel_identity" && sentinel_untouched=1
+  lifecycle_row=$(tail -1 "$state/.watch-cycle-exits.log" 2>/dev/null || true)
+  observed_bind_count=$("$real_cat" "$bind_count" 2>/dev/null || true)
+
+  cleanup_identity_bound_arm_pair \
+    "$armpid" "$arm_identity" "$child_pid" "$child_identity" 0 \
+    || fail "unbound RED containment could not retire its exact processes"
+  if test_pid_matches_identity "$sentinel_pid" "$sentinel_identity"; then
+    kill -TERM "$sentinel_pid" 2>/dev/null || true
+    wait "$sentinel_pid" 2>/dev/null || true
+  fi
+  sentinel_pid=
+  sentinel_identity=
+  arm_cleanup_active=0
+  trap - EXIT
+
+  [ "$status" -eq 1 ] || fail "unbound startup failure returned $status instead of 1"
+  [ "$child_survived" -eq 0 ] || fail "unbound cleanup forgot the exact spawned watcher"
+  [ "$sentinel_untouched" -eq 1 ] || fail "unbound cleanup signalled an unrelated process"
+  [ "$observed_bind_count" -gt 50 ] \
+    || fail "unbound cleanup never consumed a post-bind /proc snapshot"
+  grep -Fx "$child_pid" "$proc_stat_log" >/dev/null \
+    || fail "unbound cleanup did not parse the compatible child stat snapshot"
+  [ ! -s "$ps_log" ] \
+    || fail "unbound cleanup invoked unsupported ps -o: $(tr '\n' ';' < "$ps_log")"
+  ! ls "$state"/.watch-arm-output.* >/dev/null 2>&1 \
+    || fail "unbound cleanup left temp output behind"
+  [ ! -e "$state/.watch.lock" ] && [ ! -L "$state/.watch.lock" ] \
+    || fail "unbound cleanup left watcher lock evidence"
+  case "$lifecycle_row" in
+    "arm_pid=$armpid"$'\t'"watcher_pid=$child_pid"$'\t'*$'\t'"exit_code=1"$'\t'"signal=none"$'\t'"reason=startup-identity-bind-failed"$'\t'*) ;;
+    *) fail "unbound cleanup did not retain the exact startup failure lifecycle row: $lifecycle_row" ;;
+  esac
+  pass "unbound watcher cleanup uses compatible /proc fields without ps -o"
 )
 
 test_arm_hup_ignores_ambient_grace_and_cleans_foreground() {
@@ -1855,6 +2136,11 @@ if [ "${FM_TEST_ARM_HUP_STOPPED_CHILD:-0}" = 1 ]; then
   exit $?
 fi
 
+if [ "${FM_TEST_ARM_PORTABLE_PS:-0}" = 1 ]; then
+  test_arm_hup_cleans_child_and_temp_output
+  exit $?
+fi
+
 if [ "${FM_TEST_FORCE_ARM_HUP_TERM:-0}" = 1 ]; then
   test_arm_hup_cleans_child_and_temp_output
   exit $?
@@ -1867,6 +2153,11 @@ fi
 
 if [ "${FM_TEST_ARM_IDENTITY_UNAVAILABLE:-0}" = 1 ]; then
   test_arm_signal_reaps_child_when_full_identity_is_unavailable
+  exit $?
+fi
+
+if [ "${FM_TEST_ARM_UNBOUND_CYGWIN:-0}" = 1 ]; then
+  test_arm_unbound_cleanup_uses_proc_without_ps_o
   exit $?
 fi
 
@@ -1895,7 +2186,10 @@ test_attached_arm_signal_is_recorded_in_cycle_ledger
 test_arm_starts_and_self_heals
 test_arm_hup_scoped_cleanup_on_forced_term
 test_arm_preconfirmation_signals_reap_exact_spawned_child
+test_arm_cygwin_ps_preconfirmation_signals_reap_exact_spawned_child
 test_arm_signal_reaps_child_when_full_identity_is_unavailable
+test_arm_unbound_cleanup_uses_proc_without_ps_o
+test_arm_portable_ps_snapshot_cleans_child
 test_arm_hup_preserves_caller_traps
 test_arm_hup_ignores_ambient_grace_and_cleans_foreground
 test_arm_propagates_immediate_wake_before_confirmation
