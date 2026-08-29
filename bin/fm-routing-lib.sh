@@ -337,7 +337,8 @@ fm_route_read_outcomes() {
         exact(["kind","timestamp","taskId","taskClass","workType","risk","profile","provider","lane","account","elapsedSeconds","terminal"])
         and common and .terminal == "observed"
       elif .kind == "terminal" then
-        exact(["kind","timestamp","taskId","generation","profile","provider","lane","account","taskClass","workType","risk","mode","elapsedSeconds","tests","review","redundant","terminal"])
+        (exact(["kind","timestamp","taskId","generation","profile","provider","lane","account","taskClass","workType","risk","mode","elapsedSeconds","tests","review","redundant","terminal"])
+         or (exact(["kind","timestamp","taskId","generation","profile","provider","lane","account","taskClass","workType","risk","mode","elapsedSeconds","tests","review","redundant","terminal","scored"]) and .scored == false))
         and common and (.generation | identifier) and (.mode | IN("canary","automatic"))
         and (.tests | IN("pass","fail","unknown")) and (.review | IN("pass","fail","unknown"))
         and (.redundant | IN("yes","no"))
@@ -1773,7 +1774,7 @@ fm_route_append_outcome_locked() {
 }
 
 fm_route_finalize_locked() {
-  local task=$1 generation=$2 terminal=$3 claim_file=${4:-} reservation outcomes existing current state score record admission
+  local task=$1 generation=$2 terminal=$3 claim_file=${4:-} reservation outcomes existing current state score record admission never_scored now
   reservation=$(fm_route_optional_reservation_path "$task" "$generation") || return 1
   if [ -n "$reservation" ]; then
     current=$(jq -c . "$reservation" 2>/dev/null) || { fm_route_diagnostic 'invalid routing state'; return 1; }
@@ -1816,13 +1817,33 @@ fm_route_finalize_locked() {
   fi
   [ -n "$reservation" ] && [ -s "$reservation" ] || { fm_route_diagnostic 'reservation-not-found'; return 1; }
   [ "$(jq -r .generation <<<"$current")" = "$generation" ] || { fm_route_diagnostic 'reservation-generation-mismatch'; return 1; }
-  score=$(jq -c '.score // {terminal:null,tests:"unknown",review:"unknown",redundant:"no",timestamp:.createdAt}' <<<"$current")
+  # A deliberately recorded score - including an explicit {tests:"unknown",review:"unknown"} -
+  # is legitimate evidence (AGENTS.md: "unknown" is an explicitly legal outcome) and must
+  # finalize exactly as scored, unchanged. Only when .score is absent - the normal
+  # dispatch/cleanup lifecycle reached finalization without fm-route.sh score ever running -
+  # do we synthesize a placeholder, and that placeholder must never fabricate a completion
+  # timestamp: reusing the reservation's own createdAt as a fake "scored at" time always
+  # yields elapsedSeconds:0 regardless of real duration, which is false data (not merely
+  # missing data) and silently corrupts medianElapsedSeconds in `fm-route.sh report`. Use the
+  # real finalize-time wall clock instead, so elapsedSeconds is always an honest duration, and
+  # mark the record scored:false so a never-scored finalization can never be confused with a
+  # deliberately recorded unknown score - refusing to finalize here would instead let routed
+  # teardown wedge and strand the reservation, which is unacceptable for every routed task.
+  if jq -e '.score == null' <<<"$current" >/dev/null; then
+    never_scored=1
+    now=$(date +%s)
+    score=$(jq -cn --argjson now "$now" '{terminal:null,tests:"unknown",review:"unknown",redundant:"no",timestamp:$now}')
+  else
+    never_scored=0
+    score=$(jq -c '.score' <<<"$current")
+  fi
   if [ "$(jq -r '.terminal // empty' <<<"$score")" != "" ] && [ "$(jq -r .terminal <<<"$score")" != "$terminal" ]; then
     fm_route_diagnostic 'terminal-outcome-mismatch'
     return 1
   fi
-  record=$(jq -cn --argjson reservation "$current" --argjson score "$score" --arg terminal "$terminal" '
+  record=$(jq -cn --argjson reservation "$current" --argjson score "$score" --arg terminal "$terminal" --argjson neverScored "$([ "$never_scored" -eq 1 ] && echo true || echo false)" '
     {kind:"terminal",timestamp:$score.timestamp,taskId:$reservation.taskId,generation:$reservation.generation,profile:$reservation.profile,provider:$reservation.provider,lane:$reservation.lane,account:$reservation.account,taskClass:$reservation.taskClass,workType:$reservation.workType,risk:$reservation.risk,mode:$reservation.mode,elapsedSeconds:([$score.timestamp-$reservation.createdAt,0]|max),tests:$score.tests,review:$score.review,redundant:$score.redundant,terminal:$terminal}
+    + (if $neverScored then {scored:false} else {} end)
   ')
   fm_route_append_outcome_locked "$record" || return 1
   fm_route_remove_reservation_file "$reservation" || return 1
