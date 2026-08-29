@@ -9,7 +9,11 @@ LIVE="$ROOT/tests/fm-automatic-dispatch-live-e2e.test.sh"
 LAB=$(fm_test_tmproot fm-automatic-dispatch-live-guard)
 FAKEBIN="$LAB/fakebin"
 CODEX_DIR="$LAB/codex"
-mkdir -p "$FAKEBIN" "$CODEX_DIR"
+CANDIDATE="$LAB/candidate"
+PI_AUDIT="$LAB/pi-state-paths"
+mkdir -p "$FAKEBIN" "$CODEX_DIR" "$CANDIDATE/state"
+printf '%s\n' 'state/.pi-*-extension-loaded' >"$CANDIDATE/.gitignore"
+git -C "$CANDIDATE" init -q
 
 cat >"$FAKEBIN/claude" <<'SH'
 #!/usr/bin/env bash
@@ -29,8 +33,22 @@ printf '%s\n' 'codex-cli 9.9.9'
 SH
 cat >"$FAKEBIN/pi" <<'SH'
 #!/usr/bin/env bash
+state_root=${FM_STATE_OVERRIDE:-${FAKE_PI_DEFAULT_STATE:?}}
+mkdir -p "$state_root"
+printf '%s\n' watch >"$state_root/.pi-watch-extension-loaded"
+printf '%s\n' turnend >"$state_root/.pi-turnend-extension-loaded"
+printf '%s\n' "$state_root" >>"${FAKE_PI_AUDIT:?}"
+if [ "${FAKE_PI_INTERRUPT:-0}" = 1 ] && [ "${1:-}" = --version ]; then
+  while [ ! -s "${FAKE_PI_SIGNAL_FILE:?}" ]; do :; done
+  signal_pid=$(sed -n '1p' "$FAKE_PI_SIGNAL_FILE")
+  kill -TERM "$signal_pid"
+  exit 143
+fi
 case "${1:-}" in
-  --version) printf '%s\n' '9.9.9' ;;
+  --version)
+    printf '%s\n' '9.9.9'
+    exit "${FAKE_PI_VERSION_EXIT:-0}"
+    ;;
   --list-models)
     cat <<'ROWS'
 provider model context max-out thinking images
@@ -65,7 +83,34 @@ run_live() {
   local case_tmp=$1
   shift
   mkdir -p "$case_tmp"
-  TMPDIR="$case_tmp" PATH="$FAKEBIN:$PATH" CODEX_HOME="$CODEX_DIR" "$@" "$LIVE"
+  (
+    cd "$CANDIDATE" || exit 1
+    TMPDIR="$case_tmp" PATH="$FAKEBIN:$PATH" CODEX_HOME="$CODEX_DIR" \
+      FAKE_PI_DEFAULT_STATE="$CANDIDATE/state" FAKE_PI_AUDIT="$PI_AUDIT" \
+      "$@" "$LIVE"
+  )
+}
+
+candidate_marker_inventory() {
+  local marker
+  for marker in .pi-watch-extension-loaded .pi-turnend-extension-loaded; do
+    if [ -e "$CANDIDATE/state/$marker" ]; then
+      printf '%s present %s\n' "$marker" "$(cksum <"$CANDIDATE/state/$marker")"
+    else
+      printf '%s absent\n' "$marker"
+    fi
+  done
+}
+
+assert_disposable_pi_state_cleaned() {
+  local state_root
+  [ -s "$PI_AUDIT" ] || fail "Pi probe did not record its scoped state root"
+  while IFS= read -r state_root; do
+    case "$state_root" in
+      "$CANDIDATE"/*) fail "Pi probe used candidate state: $state_root" ;;
+    esac
+    [ ! -e "$state_root" ] || fail "live guard leaked disposable Pi state: $state_root"
+  done <"$PI_AUDIT"
 }
 
 test_skip_does_not_create_cleanup_registry() {
@@ -91,14 +136,66 @@ test_nonzero_version_with_output_fails_before_reporting() {
 }
 
 test_success_composes_shared_cleanup() {
-  local case_tmp="$LAB/success" out
+  local case_tmp="$LAB/success" out before after
+  : >"$PI_AUDIT"
+  before=$(candidate_marker_inventory)
   out=$(run_live "$case_tmp" env FM_AUTOMATIC_DISPATCH_LIVE_E2E=1) \
     || fail "fake live verification did not complete: $out"
+  after=$(candidate_marker_inventory)
   assert_contains "$out" 'ok - live automatic dispatch verified' "fake live verification result"
+  [ "$after" = "$before" ] || fail "live probe changed ignored candidate markers: before=[$before] after=[$after]"
+  assert_disposable_pi_state_cleaned
   assert_no_cleanup_registry "$case_tmp"
   pass "successful live verification preserves shared cleanup"
+}
+
+test_failed_pi_probe_cleans_disposable_state() {
+  local case_tmp="$LAB/pi-failure" out rc before after
+  : >"$PI_AUDIT"
+  before=$(candidate_marker_inventory)
+  set +e
+  out=$(run_live "$case_tmp" env FM_AUTOMATIC_DISPATCH_LIVE_E2E=1 FAKE_PI_VERSION_EXIT=42 2>&1)
+  rc=$?
+  set -e
+  [ "$rc" -ne 0 ] || fail "failing Pi version probe unexpectedly succeeded"
+  assert_contains "$out" 'Pi version probe failed' "failing Pi probe diagnostic"
+  after=$(candidate_marker_inventory)
+  [ "$after" = "$before" ] || fail "failed live probe changed ignored candidate markers: before=[$before] after=[$after]"
+  assert_disposable_pi_state_cleaned
+  assert_no_cleanup_registry "$case_tmp"
+  pass "failed Pi probe cleans disposable state without changing candidate markers"
+}
+
+test_interrupted_pi_probe_cleans_disposable_state() {
+  local case_tmp="$LAB/pi-interrupt" out_file="$LAB/pi-interrupt.out"
+  local signal_file="$LAB/pi-interrupt.pid" live_pid out rc before after
+  : >"$PI_AUDIT"
+  before=$(candidate_marker_inventory)
+  mkdir -p "$case_tmp"
+  set +e
+  (
+    cd "$CANDIDATE" || exit 1
+    exec env TMPDIR="$case_tmp" PATH="$FAKEBIN:$PATH" CODEX_HOME="$CODEX_DIR" \
+      FAKE_PI_DEFAULT_STATE="$CANDIDATE/state" FAKE_PI_AUDIT="$PI_AUDIT" \
+      FM_AUTOMATIC_DISPATCH_LIVE_E2E=1 FAKE_PI_INTERRUPT=1 \
+      FAKE_PI_SIGNAL_FILE="$signal_file" "$LIVE"
+  ) >"$out_file" 2>&1 &
+  live_pid=$!
+  printf '%s\n' "$live_pid" >"$signal_file"
+  wait "$live_pid"
+  rc=$?
+  set -e
+  out=$(cat "$out_file")
+  [ "$rc" -eq 143 ] || fail "interrupted Pi probe exited $rc instead of 143: $out"
+  after=$(candidate_marker_inventory)
+  [ "$after" = "$before" ] || fail "interrupted live probe changed ignored candidate markers: before=[$before] after=[$after]"
+  assert_disposable_pi_state_cleaned
+  assert_no_cleanup_registry "$case_tmp"
+  pass "interrupted Pi probe cleans disposable state without changing candidate markers"
 }
 
 test_skip_does_not_create_cleanup_registry
 test_nonzero_version_with_output_fails_before_reporting
 test_success_composes_shared_cleanup
+test_failed_pi_probe_cleans_disposable_state
+test_interrupted_pi_probe_cleans_disposable_state

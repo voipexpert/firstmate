@@ -23,6 +23,20 @@ PI_CATALOG="$LAB/pi-models.txt"
 QUOTA_REPORT="$LAB/quota.txt"
 mkdir -p "$HOME_DIR/config" "$HOME_DIR/state"
 
+candidate_marker_inventory() {
+  local marker
+  for marker in .pi-watch-extension-loaded .pi-turnend-extension-loaded; do
+    if [ -e "$ROOT/state/$marker" ]; then
+      printf '%s present %s\n' "$marker" "$(cksum <"$ROOT/state/$marker")"
+    else
+      printf '%s absent\n' "$marker"
+    fi
+  done
+}
+
+candidate_markers_before=$(candidate_marker_inventory) \
+  || fail "live automatic dispatch: candidate marker inventory failed"
+
 capture_version() {
   local destination=$1
   shift
@@ -49,7 +63,8 @@ fi
 if ! codex_version=$(capture_version "$LAB/codex.version" codex --version); then
   fail "live automatic dispatch: Codex version probe failed"
 fi
-if ! pi_version=$(capture_version "$LAB/pi.version" pi --version); then
+if ! pi_version=$(FM_HOME="$HOME_DIR" FM_STATE_OVERRIDE="$HOME_DIR/state" \
+  capture_version "$LAB/pi.version" pi --version); then
   fail "live automatic dispatch: Pi version probe failed"
 fi
 safe_version "$claude_version"
@@ -65,7 +80,8 @@ if ! quota_version=$(capture_version "$LAB/quota-axi.version" quota-axi --versio
 fi
 safe_version "$quota_version"
 
-pi --list-models >"$PI_CATALOG" 2>/dev/null \
+FM_HOME="$HOME_DIR" FM_STATE_OVERRIDE="$HOME_DIR/state" \
+  pi --list-models >"$PI_CATALOG" 2>/dev/null \
   || fail "live automatic dispatch: Pi catalog probe failed"
 while IFS=$'\t' read -r id harness model; do
   case "$harness" in
@@ -107,9 +123,15 @@ FM_HOME="$HOME_DIR" FM_STATE_OVERRIDE="$HOME_DIR/state" \
 jq -e '.action == "selected" or .action == "escalate"' "$DECISION" >/dev/null \
   || fail "live automatic dispatch: unexpected route decision"
 
+candidate_markers_after=$(candidate_marker_inventory) \
+  || fail "live automatic dispatch: candidate marker inventory failed after probes"
+[ "$candidate_markers_after" = "$candidate_markers_before" ] \
+  || fail "live automatic dispatch: Pi probes changed ignored candidate markers"
+
 printf 'catalog claude alias-sonnet=available\n'
 printf 'catalog codex gpt-5.6-sol,gpt-5.6-luna=available\n'
 printf 'catalog pi configured-aliases=available\n'
+printf 'probe candidate-markers=unchanged pi-state=disposable cleanup=registered\n'
 printf 'runtime quota-axi version=%s snapshot=read-only-valid\n' "$quota_version"
 printf 'route action=%s reason=%s selected=%s\n' \
   "$(jq -r .action "$DECISION")" "$(jq -r .reason "$DECISION")" "$(jq -r '.selected.profile // "none"' "$DECISION")"
