@@ -113,6 +113,7 @@ bin/fm-route.sh status
 
 The report must show `stage: "canary"`, `count` of at least 10, and `meetsMinimum: true`.
 Correlate its terminal, test, review, redundancy, and median elapsed fields with task evidence to establish zero lost tasks, duplicate unauthorized writes, authority violations, unresolved admission records, or material regression from static operation.
+A terminal record carrying `scored: false` was never scored through `fm-route.sh score`, so its `unknown` test and review fields are placeholders rather than recorded quality evidence and its elapsed time is measured to finalization; count those rows as missing quality evidence for this gate.
 Any fallback or circuit event must have a normalized, privacy-safe reason.
 
 ## Automatic gate
