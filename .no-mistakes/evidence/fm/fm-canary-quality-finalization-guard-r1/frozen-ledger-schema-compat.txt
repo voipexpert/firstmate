@@ -1,0 +1,17 @@
+=== Backward compatibility: the 22 frozen pre-existing ledger rows (20 simulation + 2 canary) ===
+Source: /home/yaro/work/firstmate/state/routing/outcomes.jsonl, copied read-only into a scratch state dir.
+Not rescored, not repaired, not hand-edited. Both the old and new fm_route_read_outcomes schema must accept every row.
+
+--- the two real canary rows that exposed the defect (fabricated elapsedSeconds:0) ---
+{"taskId":"mor-guard-ops-dir-look","mode":"canary","elapsedSeconds":0,"tests":"unknown","review":"unknown","terminal":"completed"}
+{"taskId":"fm-bootstrap-path-misreport","mode":"canary","elapsedSeconds":0,"tests":"unknown","review":"unknown","terminal":"completed"}
+
+--- bin/fm-route.sh report, lib = before fix ---
+{"stage":"canary","minimum":2,"count":2,"meetsMinimum":true,"terminalCounts":{"completed":2},"testCounts":{"unknown":2},"reviewCounts":{"unknown":2},"redundantCount":0,"medianElapsedSeconds":0}
+{"stage":"simulation","minimum":20,"count":20,"meetsMinimum":true,"terminalCounts":{"observed":20},"testCounts":{},"reviewCounts":{},"redundantCount":0,"medianElapsedSeconds":5400}
+--- bin/fm-route.sh report, lib = after fix ---
+{"stage":"canary","minimum":2,"count":2,"meetsMinimum":true,"terminalCounts":{"completed":2},"testCounts":{"unknown":2},"reviewCounts":{"unknown":2},"redundantCount":0,"medianElapsedSeconds":0}
+{"stage":"simulation","minimum":20,"count":20,"meetsMinimum":true,"terminalCounts":{"observed":20},"testCounts":{},"reviewCounts":{},"redundantCount":0,"medianElapsedSeconds":5400}
+
+Identical output before and after: every existing row still validates, and no existing record was altered.
+ledger byte-identical to the original after the run

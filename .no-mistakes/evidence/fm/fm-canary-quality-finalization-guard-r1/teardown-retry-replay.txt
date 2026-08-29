@@ -1,0 +1,11 @@
+=== Teardown retry / replay convergence on a never-scored routed task (lib = after fix) ===
+### teardown asks cleanup-ready for the retained terminal (no score was ever recorded)
+{"terminal":"completed"}
+### first cleanup-finalize (writes the unscored terminal record)
+{"kind":"terminal","timestamp":1788010671,"taskId":"replay-a","generation":"gen-1","profile":"profile-1","provider":"openai","lane":"codex-primary","account":"codex-primary","taskClass":"standard","workType":"implementation","risk":"medium","mode":"canary","elapsedSeconds":302,"tests":"unknown","review":"unknown","redundant":"no","terminal":"completed","scored":false}
+### teardown retry: cleanup-ready + cleanup-finalize replayed against the persisted scored:false row
+{"terminal":"completed"}
+{"kind":"terminal","timestamp":1788010671,"taskId":"replay-a","generation":"gen-1","profile":"profile-1","provider":"openai","lane":"codex-primary","account":"codex-primary","taskClass":"standard","workType":"implementation","risk":"medium","mode":"canary","elapsedSeconds":302,"tests":"unknown","review":"unknown","redundant":"no","terminal":"completed","scored":false}
+### ledger still holds exactly one row for this task (no duplicate, no wedge)
+1
+replay exit=0

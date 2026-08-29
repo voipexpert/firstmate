@@ -1,0 +1,145 @@
+Routed-work finalization: never-scored task, driven end-to-end through the real bin/fm-route.sh CLI
+(reserve -> begin/prepare/commit admission -> cleanup-finalize, the exact sequence bin/fm-teardown.sh drives).
+Task A is routed, runs ~780s of real wall clock, and is finalized WITHOUT fm-route.sh score ever being called.
+Task B is routed, runs ~180s, and an operator DELIBERATELY records tests=unknown review=unknown.
+
+############ BEFORE THE FIX (base cd8e4ce) ############
+
+### Task A: routed, ran ~13 minutes, teardown finalizes it with NO score recorded
+{
+  "kind": "terminal",
+  "timestamp": 1788009564,
+  "taskId": "canary-a",
+  "generation": "gen-1",
+  "profile": "profile-1",
+  "provider": "openai",
+  "lane": "codex-primary",
+  "account": "codex-primary",
+  "taskClass": "standard",
+  "workType": "implementation",
+  "risk": "medium",
+  "mode": "canary",
+  "elapsedSeconds": 0,
+  "tests": "unknown",
+  "review": "unknown",
+  "redundant": "no",
+  "terminal": "completed"
+}
+
+### Task B: routed, ran ~3 minutes, operator DELIBERATELY recorded tests=unknown review=unknown
+{
+  "kind": "terminal",
+  "timestamp": 1788010350,
+  "taskId": "canary-b",
+  "generation": "gen-1",
+  "profile": "profile-1",
+  "provider": "openai",
+  "lane": "codex-primary",
+  "account": "codex-primary",
+  "taskClass": "standard",
+  "workType": "implementation",
+  "risk": "medium",
+  "mode": "canary",
+  "elapsedSeconds": 186,
+  "tests": "unknown",
+  "review": "unknown",
+  "redundant": "no",
+  "terminal": "completed"
+}
+
+### Persisted ledger (state/routing/outcomes.jsonl)
+{"kind":"terminal","timestamp":1788009564,"taskId":"canary-a","generation":"gen-1","profile":"profile-1","provider":"openai","lane":"codex-primary","account":"codex-primary","taskClass":"standard","workType":"implementation","risk":"medium","mode":"canary","elapsedSeconds":0,"tests":"unknown","review":"unknown","redundant":"no","terminal":"completed"}
+{"kind":"terminal","timestamp":1788010350,"taskId":"canary-b","generation":"gen-1","profile":"profile-1","provider":"openai","lane":"codex-primary","account":"codex-primary","taskClass":"standard","workType":"implementation","risk":"medium","mode":"canary","elapsedSeconds":186,"tests":"unknown","review":"unknown","redundant":"no","terminal":"completed"}
+
+### bin/fm-route.sh report --stage canary --minimum 1
+{
+  "stage": "canary",
+  "minimum": 1,
+  "count": 2,
+  "meetsMinimum": true,
+  "terminalCounts": {
+    "completed": 2
+  },
+  "testCounts": {
+    "unknown": 2
+  },
+  "reviewCounts": {
+    "unknown": 2
+  },
+  "redundantCount": 0,
+  "medianElapsedSeconds": 93
+}
+
+### Capacity is released, not stranded: leftover reservations/claims after teardown finalization
+reservation files remaining: 0
+
+############ AFTER THE FIX (target 4161c3b) ############
+
+### Task A: routed, ran ~13 minutes, teardown finalizes it with NO score recorded
+{
+  "kind": "terminal",
+  "timestamp": 1788010354,
+  "taskId": "canary-a",
+  "generation": "gen-1",
+  "profile": "profile-1",
+  "provider": "openai",
+  "lane": "codex-primary",
+  "account": "codex-primary",
+  "taskClass": "standard",
+  "workType": "implementation",
+  "risk": "medium",
+  "mode": "canary",
+  "elapsedSeconds": 784,
+  "tests": "unknown",
+  "review": "unknown",
+  "redundant": "no",
+  "terminal": "completed",
+  "scored": false
+}
+
+### Task B: routed, ran ~3 minutes, operator DELIBERATELY recorded tests=unknown review=unknown
+{
+  "kind": "terminal",
+  "timestamp": 1788010355,
+  "taskId": "canary-b",
+  "generation": "gen-1",
+  "profile": "profile-1",
+  "provider": "openai",
+  "lane": "codex-primary",
+  "account": "codex-primary",
+  "taskClass": "standard",
+  "workType": "implementation",
+  "risk": "medium",
+  "mode": "canary",
+  "elapsedSeconds": 185,
+  "tests": "unknown",
+  "review": "unknown",
+  "redundant": "no",
+  "terminal": "completed"
+}
+
+### Persisted ledger (state/routing/outcomes.jsonl)
+{"kind":"terminal","timestamp":1788010354,"taskId":"canary-a","generation":"gen-1","profile":"profile-1","provider":"openai","lane":"codex-primary","account":"codex-primary","taskClass":"standard","workType":"implementation","risk":"medium","mode":"canary","elapsedSeconds":784,"tests":"unknown","review":"unknown","redundant":"no","terminal":"completed","scored":false}
+{"kind":"terminal","timestamp":1788010355,"taskId":"canary-b","generation":"gen-1","profile":"profile-1","provider":"openai","lane":"codex-primary","account":"codex-primary","taskClass":"standard","workType":"implementation","risk":"medium","mode":"canary","elapsedSeconds":185,"tests":"unknown","review":"unknown","redundant":"no","terminal":"completed"}
+
+### bin/fm-route.sh report --stage canary --minimum 1
+{
+  "stage": "canary",
+  "minimum": 1,
+  "count": 2,
+  "meetsMinimum": true,
+  "terminalCounts": {
+    "completed": 2
+  },
+  "testCounts": {
+    "unknown": 2
+  },
+  "reviewCounts": {
+    "unknown": 2
+  },
+  "redundantCount": 0,
+  "medianElapsedSeconds": 484.5
+}
+
+### Capacity is released, not stranded: leftover reservations/claims after teardown finalization
+reservation files remaining: 0
