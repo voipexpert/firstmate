@@ -357,6 +357,10 @@
       "audience": "maintainer-architecture"
     },
     {
+      "path": "docs/superpowers/specs/2026-08-30-firstmate-automatic-routing-activation-design.md",
+      "audience": "maintainer-architecture"
+    },
+    {
       "path": "docs/supervision-protocols/claude.md",
       "audience": "agent-runtime"
     },
