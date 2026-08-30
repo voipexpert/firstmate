@@ -819,6 +819,111 @@ CODEX_HOME="$tmp/overrides" /usr/bin/codex -c 'approval_policy="never"' -c 'sand
 
 Both rendered the identical first screen, `Do you trust the contents of this directory?` with `1. Yes, continue` preselected, so the flag form stalled an untrusted root exactly as the `-c` form does.
 
+### Hooks review dialog
+
+Codex 0.147.0 stops crewmate and secondmate launches on a `Hooks need review` dialog whenever the worktree carries tracked hook config, because every firstmate worktree ships `.codex/hooks.json`.
+Unanswered, the dialog leaves the brief unread and the pane looks wedged to supervision; it was observed live on 2026-08-30 against a spawned codex canary.
+Both codex launch templates in `bin/fm-spawn.sh` clear it, by different means, because the two worker kinds differ in whether the hook source is vetted.
+A crewmate or scout runs in an isolated task worktree whose branch may carry unvetted edits to `.codex/hooks.json` itself, so it must never auto-trust that file and gets `-c 'features.hooks=false'`, confirmed on 2026-08-30 against the installed build as the documented spelling for disabling the `hooks` feature:
+
+```sh
+$ codex --version
+codex-cli 0.147.0
+$ codex features list | grep -w hooks
+hooks                                stable             true
+$ codex --help | grep -A1 -- '--disable <FEATURE>'
+      --disable <FEATURE>
+          Disable a feature (repeatable). Equivalent to `-c features.<name>=false`
+```
+
+A separate isolated exact-launch probe on this same codex-cli build confirmed the crewmate form end to end: the `Hooks need review` dialog was skipped, the agent executed unrestricted, it replied a fixed marker, and the launch template's `notify` callback still fired.
+
+A secondmate must NOT switch the hooks engine off wholesale, so it clears the same dialog with a different flag that the same build exposes:
+
+```sh
+$ codex --help | grep -A2 -- '--dangerously-bypass-hook-trust'
+      --dangerously-bypass-hook-trust
+          Run enabled hooks without requiring persisted hook trust for this invocation. DANGEROUS.
+          Intended only for automation that already vets hook sources
+```
+
+A valid `.fm-secondmate-home` marker force-includes the home in primary scope (`bin/fm-primary-scope-lib.sh`), and its hook source is this repository's own tracked file rather than a branch's, so Firstmate has already vetted it.
+`tests/fm-spawn-dispatch-profile.test.sh` pins the crewmate override and `tests/fm-secondmate-harness.test.sh` pins the secondmate flag together with the absence of `features.hooks=false`.
+
+#### Launch-form matrix, probed live 2026-08-30
+
+Probed on the installed codex-cli 0.147.0 in an isolated `CODEX_HOME` (stub auth, project root pre-trusted via `[projects."<root>"] trust_level = "trusted"`) against a scratch project carrying a tracked `.codex/hooks.json` with one `SessionStart` entry, launched under a 160x45 tmux pty.
+"Composer reached" means the startup dialog cleared; the `Active` column is the engine's own report from the in-session `/hooks` panel.
+
+| Launch form | Startup dialog | `/hooks` SessionStart row |
+|---|---|---|
+| bare, hook untrusted | parks on `Hooks need review` | Installed 1, Active 0, Review 1 |
+| `-c 'bypass_hook_trust=true'` | parks on `Hooks need review` | Installed 1, Active 0, Review 1 |
+| `--dangerously-bypass-hook-trust` | cleared, composer reached | Installed 1, Active 0, Review 1 |
+| `-c 'features.hooks=false'` | cleared, composer reached | Installed 0, Active 0, Review 0 |
+| bare, after persisted trust | cleared, composer reached | Installed 1, Active 1, Review 0 |
+
+Two results from that matrix are load-bearing and neither is what the flag names suggest.
+
+First, `-c 'bypass_hook_trust=true'` is NOT a launch-time config spelling on this build.
+The binary does contain a `` `bypass_hook_trust` override must be a boolean `` validator, but neither the TUI nor `codex exec` rejects `-c 'bypass_hook_trust=notabool'`, so the key is not parsed on either path; the override is accepted silently and changes nothing, leaving the launch parked on the dialog exactly as a bare launch does.
+It is therefore not a collision-free substitute for the flag, and must not be used as one.
+
+Second, `--dangerously-bypass-hook-trust` clears the dialog but does not by itself flip the tracked hook to active: the entry still reports `Active 0 / Review 1` under the flag, and only persisted trust (answering the review panel with `t`, which writes `[hooks.state."<abs hooks.json path>:session_start:0:0"] trusted_hash = "sha256:..."` into `$CODEX_HOME/config.toml`) reaches `Active 1`.
+The flag's banner, which persists for the whole session rather than printing once, reads:
+
+```
+⚠ `--dangerously-bypass-hook-trust` is enabled. Enabled hooks may run without review for this invocation.
+```
+
+Whether "may run without review for this invocation" means the entry executes at turn boundaries despite the `Active 0` report was NOT established here, because completing a real turn needs live credentials this probe deliberately did not supply.
+So the secondmate template is recorded as leaving the hooks engine installed and clearing the dialog, and NOT as a proven guarantee that the secondmate's turn-end guard and arm/cd seatbelts fire.
+`docs/turnend-guard.md` states the contract at that same strength.
+Closing this gap needs a credentialed turn-level probe, and until then a codex secondmate must not be treated as having a verified turn-end backstop.
+
+#### Where codex resolves project hooks from
+
+Probed the same day, same build: codex 0.147.0 resolves project hooks from the MAIN checkout, not from the launch cwd.
+Launched with cwd set to a linked git worktree whose own `.codex/hooks.json` had been overwritten with a distinctive `SessionStart` entry, the `/hooks` panel reported `Source  Project config - <main worktree>/.codex/hooks.json` and the distinctive entry never appeared.
+With cwd set to a plain checkout carrying this repository's tracked hook file, all four entries were discovered (`4 hooks need review before they can run`).
+
+Two consequences follow.
+
+A crewmate or scout cannot inject hooks through its own task branch, because the worktree's copy is never read; conversely the file a crew pane WOULD be asked to trust is the captain's own primary hook set from the main checkout.
+That is precisely the file a worker must never trust or run, which is the rationale the crewmate override rests on.
+
+A worktree whose git common dir is a bare repository - the shape this gate uses - has no main working tree, so nothing is discovered and no dialog appears at all.
+A hooks-review stall is therefore reproducible from an ordinary linked worktree of a normal checkout but NOT from inside a bare-backed gate worktree; do not read a quiet launch there as evidence the dialog is gone.
+
+#### Accepted residual: the bare-flag collision
+
+`--dangerously-bypass-hook-trust` is the one deliberate bare `--dangerously-*` flag in a codex launch template, against the collision rule recorded above for `--dangerously-bypass-approvals-and-sandbox`, and it fails the same way:
+
+```sh
+$ codex --dangerously-bypass-hook-trust --dangerously-bypass-hook-trust --help; echo "exit=$?"
+error: the argument '--dangerously-bypass-hook-trust' cannot be used multiple times
+exit=2
+```
+
+It is kept because the alternatives are worse: the config spelling does not exist (above), and seeding `hooks.state` trust into a `CODEX_HOME` is keyed by absolute hooks-file path AND content hash, so it would break on every `.codex/hooks.json` edit and on every new secondmate home path.
+The residual is accepted, not fixed: no shipped Firstmate entry point may prepend this flag, or every codex secondmate spawn dies at exit 2 with no pane and no brief.
+The entry point on the reference machine prepends only `--dangerously-bypass-approvals-and-sandbox`, which does not collide.
+
+#### Supersession note
+
+The task's original `--intent` required `-c 'features.hooks=false'` on BOTH codex templates.
+A later authoritative owner correction superseded that for the secondmate only, on the ground that a marked secondmate home is a controlled primary rather than a branch-controlled worktree.
+The shipped secondmate template therefore carries `--dangerously-bypass-hook-trust` and deliberately does not carry `features.hooks=false`; the crewmate and scout template still matches the original intent exactly.
+
+The crewmate override is a deliberate trust decision with a real cost, not a free one.
+Three of the four tracked codex hook commands are primary-scoped and would indeed be inert in a linked task worktree: `bin/fm-sessionstart-run.sh` and `bin/fm-turnend-guard.sh` call `fm_primary_scope_matches`, and `bin/fm-cd-pretool-check.sh` applies the git-common-dir test.
+`bin/fm-arm-pretool-check.sh` applies no scope test at all, so it would otherwise fire in a crew worktree; turning the engine off means a codex crew pane loses the `broad-watcher-kill` and watcher-arm anti-pattern denials that a claude crew pane keeps through the identical unscoped `PreToolUse` entry in `.claude/settings.json`.
+That loss is accepted, because trusting a branch's own hook file to police that branch is the larger hazard, and on 0.147.0 the only worker-safe dialog answer ("3. Continue without trusting") already leaves hooks off.
+
+The dialog is also direct evidence that the 0.145.0 semantic-busy verdict recorded in [`supervision.md`](supervision.md) - that firstmate-written project hooks under `<worktree>/.codex/` never fired - is version-scoped and no longer describes 0.147.0, which plainly does load them in the TUI.
+That verdict was never re-probed on this build, so `fm_busy_codex_hooks_verified` in `bin/fm-busy-lib.sh` stays closed; the comment there records that opening it requires revisiting the crewmate override first, because hooks-off would silence the very lifecycle hooks the gate arms and leave a worker's busy record unsettled with no error surfaced.
+The secondmate template is already compatible with a future open gate, since it leaves the engine on.
+
 ## Codex App host tools
 
 A reusable Desktop host-tool smoke ran on 2026-07-06 against Codex Desktop bundle version 26.623.101652, build 4674, bundle id `com.openai.codex`.

@@ -856,8 +856,10 @@ test_spawn_explicit_harness_does_not_inherit_secondmate_harness_tokens() {
   [ "$(meta_field "$meta" model)" = default ] || fail "explicit-harness-no-tokens: meta model should stay default"
   [ "$(meta_field "$meta" effort)" = default ] || fail "explicit-harness-no-tokens: meta effort should stay default"
   launch=$(cat "$launchlog")
-  assert_contains "$launch" "codex -c 'approval_policy=\"never\"' -c 'sandbox_mode=\"danger-full-access\"'" \
+  assert_contains "$launch" "codex -c 'approval_policy=\"never\"' -c 'sandbox_mode=\"danger-full-access\"' --dangerously-bypass-hook-trust" \
     "explicit-harness-no-tokens: launch did not use codex"
+  assert_not_contains "$launch" "features.hooks=false" \
+    "explicit-harness-no-tokens: a codex secondmate is a controlled primary and must keep its own turn-end and arm/cd hooks, so it clears the hooks-review dialog with --dangerously-bypass-hook-trust rather than disabling the engine"
   assert_not_contains "$launch" "--model" "explicit-harness-no-tokens: launch must not carry a --model flag"
   assert_not_contains "$launch" "model_reasoning_effort" \
     "explicit-harness-no-tokens: launch must not carry a codex effort flag"

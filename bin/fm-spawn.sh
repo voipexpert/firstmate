@@ -1380,10 +1380,47 @@ launch_template() {
       # plus danger-full-access posture, is idempotent over a CODEX_HOME config that
       # already grants those keys, and never collides with an externally supplied
       # flag, so an unconfigured home still launches fully unrestricted.
+      # Both kinds must clear codex-cli 0.147.0's "Hooks need review" dialog,
+      # which otherwise stalls the launch with the brief unread while the pane
+      # looks wedged to supervision (observed live 2026-08-30). They clear it
+      # differently because they differ in whether the hook source is vetted.
+      # A secondmate is a controlled Firstmate primary: its hook source is this
+      # repo's own tracked .codex/hooks.json, and a valid .fm-secondmate-home
+      # marker puts the home in primary scope (bin/fm-primary-scope-lib.sh), so
+      # it must not have its hooks engine switched off wholesale.
+      # --dangerously-bypass-hook-trust clears the dialog and leaves the engine
+      # installed. It does NOT by itself mark an untrusted hook active: on
+      # 0.147.0 /hooks still reports the tracked entry Installed=1 Active=0
+      # Review=1 under the flag, and only persisted trust reaches Active=1, so
+      # do not read this template as a guarantee that the secondmate's guards
+      # run (docs/verification/runtime-backends.md "Hooks review dialog").
+      # This is the one deliberate bare --dangerously-* flag in a codex
+      # template, against the collision rule above, because the config spelling
+      # does not exist on this build: -c 'bypass_hook_trust=true' is accepted
+      # silently and changes nothing, leaving the launch parked on the dialog.
+      # The residual is accepted rather than fixed: a codex entry point that
+      # also prepends this flag makes every secondmate spawn die at exit 2
+      # ("cannot be used multiple times"), so no shipped entry point may add it.
+      # A crewmate or scout instead runs in a linked task worktree, and on
+      # 0.147.0 codex resolves project hooks from the MAIN checkout rather than
+      # the cwd: with cwd set to a linked worktree it loads the main worktree's
+      # .codex/hooks.json and ignores the linked worktree's own copy entirely.
+      # The file a crew pane would be asked to trust is therefore the captain's
+      # PRIMARY-session hook set, which a worker must never trust or run, so
+      # -c features.hooks=false turns the engine off. That is not free. It also
+      # drops bin/fm-arm-pretool-check.sh, the
+      # one tracked codex hook with no primary-scope test and therefore the one
+      # that would otherwise fire in a linked worktree, so a codex crew pane
+      # loses the broad-watcher-kill and watcher-arm anti-pattern denials a
+      # claude crew pane keeps. That loss is accepted deliberately, because
+      # trusting a branch's own hook file to police that branch is the larger
+      # hazard. Opening fm_busy_codex_hooks_verified in bin/fm-busy-lib.sh
+      # means revisiting this crewmate override, which would silence the very
+      # lifecycle hooks that gate arms.
       if [ "$kind" = secondmate ]; then
-        printf '%s' 'codex __MODELFLAG____EFFORTFLAG__-c '\''approval_policy="never"'\'' -c '\''sandbox_mode="danger-full-access"'\'' "$(__OPINPUT__ encode launch-brief < __BRIEF__)"'
+        printf '%s' 'codex __MODELFLAG____EFFORTFLAG__-c '\''approval_policy="never"'\'' -c '\''sandbox_mode="danger-full-access"'\'' --dangerously-bypass-hook-trust "$(__OPINPUT__ encode launch-brief < __BRIEF__)"'
       else
-        printf '%s' 'codex __MODELFLAG____EFFORTFLAG__-c '\''approval_policy="never"'\'' -c '\''sandbox_mode="danger-full-access"'\'' -c "notify=[\"bash\",\"-c\",\"touch __TURNEND__\"]" "$(__OPINPUT__ encode launch-brief < __BRIEF__)"'
+        printf '%s' 'codex __MODELFLAG____EFFORTFLAG__-c '\''approval_policy="never"'\'' -c '\''sandbox_mode="danger-full-access"'\'' -c '\''features.hooks=false'\'' -c "notify=[\"bash\",\"-c\",\"touch __TURNEND__\"]" "$(__OPINPUT__ encode launch-brief < __BRIEF__)"'
       fi
       ;;
     opencode) printf '%s' 'OPENCODE_CONFIG_CONTENT='\''{"permission":{"*":"allow"}}'\'' opencode __MODELFLAG__--prompt "$(__OPINPUT__ encode launch-brief < __BRIEF__)"' ;;

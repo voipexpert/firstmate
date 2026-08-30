@@ -195,6 +195,7 @@ codex exec --dangerously-bypass-approvals-and-sandbox --dangerously-bypass-hook-
 The daemon refused with `managed standalone Codex install not found`, and an interactive TUI worker neither starts nor attaches to the app-server control socket, so no client can observe its turns.
 In this 2026-07-28 Codex 0.145.0 semantic-busy probe, Firstmate-written lifecycle project hooks under `<worktree>/.codex/hooks.json` fired for neither an interactive pane whose directory trust was granted nor `codex exec`, in both cases with `--dangerously-bypass-hook-trust`, while an untracked global probe fired in the same runs; Firstmate does not ship, install, recommend, or depend on that global path.
 Codex also exposes no `StopFailure` hook, so an API-error turn end would need separate coverage even after hook discovery works.
+That project-hook discovery finding is scoped to 0.145.0 and no longer describes 0.147.0, which loads project hooks in the TUI and stops the launch on a `Hooks need review` dialog ([`runtime-backends.md`](runtime-backends.md) "Hooks review dialog"); the gate stays closed because the lifecycle hooks were never re-probed on that build, and reopening it must revisit the `-c 'features.hooks=false'` worker launch override first.
 The app-server protocol schema does define the required lifecycle (`turn/started`, plus a `turn/completed` status of `completed`, `interrupted`, `failed`, or `inProgress`), so the gate is a reachability problem rather than a protocol gap.
 
 Deterministic entry points:
