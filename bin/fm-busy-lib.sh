@@ -138,11 +138,13 @@ fm_busy_codex_appserver_observable() {
 # That "never fired" verdict is version-scoped and does NOT describe 0.147.0,
 # which loads project hooks in the TUI and stops the launch on a "Hooks need
 # review" dialog (docs/verification/runtime-backends.md "Hooks review dialog").
-# Opening this gate therefore requires revisiting the codex launch templates in
-# bin/fm-spawn.sh first: they pass -c 'features.hooks=false' to clear that
-# dialog, which would disable the very UserPromptSubmit/Stop hooks this gate
-# arms, so a worker's busy record would never settle and it would classify
-# unknown with no error anywhere. Re-verify against the installed build before
+# Opening this gate therefore requires revisiting the codex crewmate launch
+# template in bin/fm-spawn.sh first: it passes -c 'features.hooks=false' to
+# clear that dialog, which would disable the very UserPromptSubmit/Stop hooks
+# this gate arms, so a worker's busy record would never settle and it would
+# classify unknown with no error anywhere. The secondmate template is already
+# compatible because it clears the dialog with --dangerously-bypass-hook-trust
+# and leaves the engine on. Re-verify against the installed build before
 # returning 0 here.
 fm_busy_codex_hooks_verified() {
   return 1

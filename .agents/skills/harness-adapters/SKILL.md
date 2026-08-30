@@ -214,7 +214,7 @@ Claude Code's primary watcher protocol is Stop-owned: the auto-arm hook fires on
 
 | Fact | Value |
 |---|---|
-| Busy state | Unknown until a semantic source is live-verified: the app-server turn lifecycle is unreachable for a pane worker, and project lifecycle hooks did not fire for a firstmate-launched worker. |
+| Busy state | Unknown until a semantic source is live-verified: the app-server turn lifecycle is unreachable for a pane worker, and project lifecycle hooks did not fire for a firstmate-launched worker on 0.145.0. That hook verdict is version-scoped and does not describe 0.147.0, which plainly loads project hooks in the TUI (see the hooks-review dialog below), but it was never re-probed there, so `fm_busy_codex_hooks_verified` in `bin/fm-busy-lib.sh` stays closed; reopening it means revisiting the crewmate launch override first. |
 | Exit command | `/quit` (slash popup needs about 1 second between text and Enter; the shared submit path used by `fm-control` handles it) |
 | Interrupt | single Escape |
 | Skill invocation | `$<skill>` (e.g. `$no-mistakes`); `/<skill>` is claude-only and codex rejects it as "Unrecognized command" |
@@ -229,8 +229,10 @@ Directory trust dialog on first run per repo root: "Do you trust the contents of
 Accept with Enter.
 The decision persists for the repo, so later worktrees of the same project skip it.
 
-Codex 0.147.0 also stops crew and secondmate launches on a `Hooks need review` dialog whenever the worktree carries tracked hook config, since every firstmate worktree ships PRIMARY-session hooks a worker pane must never trust or run; both codex launch templates carry `-c 'features.hooks=false'` to skip it (`docs/verification/runtime-backends.md` "Hooks review dialog").
-For a crewmate or scout that costs nothing, because their linked task worktrees are already out of primary scope. For a secondmate it is a real tradeoff: a marked secondmate home IS in primary scope, so that pane deliberately runs with no turn-end guard, no session-start digest, and no arm/cd PreToolUse seatbelts; `docs/turnend-guard.md` owns that contract and pi is the stronger secondmate harness where the backstop matters.
+Codex 0.147.0 also stops crew and secondmate launches on a `Hooks need review` dialog whenever the worktree carries tracked hook config, since every firstmate worktree ships this repo's `.codex/hooks.json`.
+Both codex launch templates clear it, by different means (`docs/verification/runtime-backends.md` "Hooks review dialog").
+A crewmate or scout gets `-c 'features.hooks=false'`, because its isolated task worktree may carry branch-controlled edits to that hook file and must not auto-trust them. That is not free: it also disables `bin/fm-arm-pretool-check.sh`, the one tracked codex hook with no primary-scope test, so a codex crew pane loses the `broad-watcher-kill` and watcher-arm denials a claude crew pane keeps. The trust hazard is judged the larger one.
+A secondmate instead gets `--dangerously-bypass-hook-trust`, which skips the dialog with the engine left on: a marked secondmate home is a controlled Firstmate primary whose hook source is this repo's own tracked file, so it keeps its turn-end guard and its arm/cd seatbelts (`docs/turnend-guard.md`).
 
 Resume after exit with `codex resume <session-id>`.
 The session id is printed on quit.

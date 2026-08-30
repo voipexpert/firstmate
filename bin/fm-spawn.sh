@@ -1380,20 +1380,29 @@ launch_template() {
       # plus danger-full-access posture, is idempotent over a CODEX_HOME config that
       # already grants those keys, and never collides with an externally supplied
       # flag, so an unconfigured home still launches fully unrestricted.
-      # -c features.hooks=false skips codex-cli 0.147.0's "Hooks need review"
-      # dialog, which otherwise stalls the launch waiting on a captain-only
-      # decision: every firstmate worktree carries tracked primary-session
-      # hooks a worker pane must never trust or run (verified live 2026-08-30).
-      # It is free for a crewmate or scout, whose linked task worktree is
-      # already outside primary scope, and a deliberate tradeoff for a
-      # secondmate, whose marked home IS in primary scope and therefore runs
-      # with no turn-end guard and no arm/cd seatbelts; docs/turnend-guard.md
-      # owns that contract. It also gates fm_busy_codex_hooks_verified in
-      # bin/fm-busy-lib.sh: opening that busy gate means revisiting this
-      # override, because hooks-off would silence the very lifecycle hooks the
-      # gate arms.
+      # Both kinds must clear codex-cli 0.147.0's "Hooks need review" dialog,
+      # which otherwise stalls the launch with the brief unread while the pane
+      # looks wedged to supervision (observed live 2026-08-30). They clear it
+      # differently because they differ in whether the hook source is vetted.
+      # A secondmate is a controlled Firstmate primary: its hook source is this
+      # repo's own tracked .codex/hooks.json, and a valid .fm-secondmate-home
+      # marker puts the home in primary scope (bin/fm-primary-scope-lib.sh), so
+      # it must KEEP its turn-end guard and its arm/cd PreToolUse seatbelts.
+      # --dangerously-bypass-hook-trust skips the dialog with the engine on.
+      # A crewmate or scout instead runs in an isolated task worktree whose
+      # branch may carry unvetted edits to .codex/hooks.json itself, so it must
+      # never auto-trust that file: -c features.hooks=false turns the engine
+      # off. That is not free. It also drops bin/fm-arm-pretool-check.sh, the
+      # one tracked codex hook with no primary-scope test and therefore the one
+      # that would otherwise fire in a linked worktree, so a codex crew pane
+      # loses the broad-watcher-kill and watcher-arm anti-pattern denials a
+      # claude crew pane keeps. That loss is accepted deliberately, because
+      # trusting a branch's own hook file to police that branch is the larger
+      # hazard. Opening fm_busy_codex_hooks_verified in bin/fm-busy-lib.sh
+      # means revisiting this crewmate override, which would silence the very
+      # lifecycle hooks that gate arms.
       if [ "$kind" = secondmate ]; then
-        printf '%s' 'codex __MODELFLAG____EFFORTFLAG__-c '\''approval_policy="never"'\'' -c '\''sandbox_mode="danger-full-access"'\'' -c '\''features.hooks=false'\'' "$(__OPINPUT__ encode launch-brief < __BRIEF__)"'
+        printf '%s' 'codex __MODELFLAG____EFFORTFLAG__-c '\''approval_policy="never"'\'' -c '\''sandbox_mode="danger-full-access"'\'' --dangerously-bypass-hook-trust "$(__OPINPUT__ encode launch-brief < __BRIEF__)"'
       else
         printf '%s' 'codex __MODELFLAG____EFFORTFLAG__-c '\''approval_policy="never"'\'' -c '\''sandbox_mode="danger-full-access"'\'' -c '\''features.hooks=false'\'' -c "notify=[\"bash\",\"-c\",\"touch __TURNEND__\"]" "$(__OPINPUT__ encode launch-brief < __BRIEF__)"'
       fi

@@ -821,9 +821,10 @@ Both rendered the identical first screen, `Do you trust the contents of this dir
 
 ### Hooks review dialog
 
-Codex 0.147.0 stops crewmate and secondmate launches on a `Hooks need review` dialog whenever the worktree carries tracked hook config, because every firstmate worktree ships `.codex/hooks.json` with PRIMARY-session hooks a crew or secondmate pane must never trust or run.
+Codex 0.147.0 stops crewmate and secondmate launches on a `Hooks need review` dialog whenever the worktree carries tracked hook config, because every firstmate worktree ships `.codex/hooks.json`.
 Unanswered, the dialog leaves the brief unread and the pane looks wedged to supervision; it was observed live on 2026-08-30 against a spawned codex canary.
-Both codex launch templates in `bin/fm-spawn.sh` now add `-c 'features.hooks=false'`, confirmed on 2026-08-30 against the same installed build as the documented spelling for disabling the `hooks` feature:
+Both codex launch templates in `bin/fm-spawn.sh` clear it, by different means, because the two worker kinds differ in whether the hook source is vetted.
+A crewmate or scout runs in an isolated task worktree whose branch may carry unvetted edits to `.codex/hooks.json` itself, so it must never auto-trust that file and gets `-c 'features.hooks=false'`, confirmed on 2026-08-30 against the installed build as the documented spelling for disabling the `hooks` feature:
 
 ```sh
 $ codex --version
@@ -835,18 +836,29 @@ $ codex --help | grep -A1 -- '--disable <FEATURE>'
           Disable a feature (repeatable). Equivalent to `-c features.<name>=false`
 ```
 
-A separate isolated exact-launch probe on this same codex-cli build confirmed the fix end to end: the `Hooks need review` dialog was skipped, the agent executed unrestricted, it replied a fixed marker, and the launch template's `notify` callback still fired.
-`tests/fm-spawn-dispatch-profile.test.sh` and `tests/fm-secondmate-harness.test.sh` pin the composed override for both templates.
+A separate isolated exact-launch probe on this same codex-cli build confirmed the crewmate form end to end: the `Hooks need review` dialog was skipped, the agent executed unrestricted, it replied a fixed marker, and the launch template's `notify` callback still fired.
 
-Two consequences are deliberate and recorded elsewhere so neither can drift silently.
+A secondmate must NOT disable hooks, so it clears the same dialog with a different flag that the same build exposes:
 
-For a crewmate or scout the override costs nothing, because a linked task worktree already fails the git-dir primary-scope test and those hooks would be inert anyway.
-For a secondmate it is a real tradeoff: a valid `.fm-secondmate-home` marker force-includes that home in primary scope (`bin/fm-primary-scope-lib.sh`), so the pane deliberately runs with no Stop turn-end guard, no session-start digest, and no arm/cd `PreToolUse` seatbelts.
-`docs/turnend-guard.md` owns that contract, and `docs/supervision-protocols/codex.md` and `docs/cd-guard.md` carry the matching qualifications.
-Prefer a pi secondmate where the turn-end backstop must hold, since its template loads the primary extensions explicitly.
+```sh
+$ codex --help | grep -A2 -- '--dangerously-bypass-hook-trust'
+      --dangerously-bypass-hook-trust
+          Run enabled hooks without requiring persisted hook trust for this invocation. DANGEROUS.
+          Intended only for automation that already vets hook sources
+```
+
+That is exactly the secondmate case: a valid `.fm-secondmate-home` marker force-includes the home in primary scope (`bin/fm-primary-scope-lib.sh`), and its hook source is this repository's own tracked file rather than a branch's, so Firstmate has already vetted it.
+The pane therefore keeps its Stop turn-end guard, its session-start digest, and its arm/cd `PreToolUse` seatbelts, and `docs/turnend-guard.md` owns that contract.
+`tests/fm-spawn-dispatch-profile.test.sh` pins the crewmate override and `tests/fm-secondmate-harness.test.sh` pins the secondmate flag together with the absence of `features.hooks=false`.
+
+The crewmate override is a deliberate trust decision with a real cost, not a free one.
+Three of the four tracked codex hook commands are primary-scoped and would indeed be inert in a linked task worktree: `bin/fm-sessionstart-run.sh` and `bin/fm-turnend-guard.sh` call `fm_primary_scope_matches`, and `bin/fm-cd-pretool-check.sh` applies the git-common-dir test.
+`bin/fm-arm-pretool-check.sh` applies no scope test at all, so it would otherwise fire in a crew worktree; turning the engine off means a codex crew pane loses the `broad-watcher-kill` and watcher-arm anti-pattern denials that a claude crew pane keeps through the identical unscoped `PreToolUse` entry in `.claude/settings.json`.
+That loss is accepted, because trusting a branch's own hook file to police that branch is the larger hazard, and on 0.147.0 the only worker-safe dialog answer ("3. Continue without trusting") already leaves hooks off.
 
 The dialog is also direct evidence that the 0.145.0 semantic-busy verdict recorded in [`supervision.md`](supervision.md) - that firstmate-written project hooks under `<worktree>/.codex/` never fired - is version-scoped and no longer describes 0.147.0, which plainly does load them in the TUI.
-That verdict was never re-probed on this build, so `fm_busy_codex_hooks_verified` in `bin/fm-busy-lib.sh` stays closed; the comment there records that opening it requires revisiting this launch override first, because hooks-off would silence the very lifecycle hooks the gate arms and leave a worker's busy record unsettled with no error surfaced.
+That verdict was never re-probed on this build, so `fm_busy_codex_hooks_verified` in `bin/fm-busy-lib.sh` stays closed; the comment there records that opening it requires revisiting the crewmate override first, because hooks-off would silence the very lifecycle hooks the gate arms and leave a worker's busy record unsettled with no error surfaced.
+The secondmate template is already compatible with a future open gate, since it leaves the engine on.
 
 ## Codex App host tools
 

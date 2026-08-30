@@ -1011,6 +1011,9 @@ families_for_changed_path() {
     bin/fm-peek.sh|bin/fm-composer*)
       printf '%s\n' backend-dispatch
       printf '%s\n' pure-contract-unit
+      # launch_template() branches on kind, and the secondmate branch is pinned
+      # only by the secondmate family, so a spawn edit must select it too.
+      printf '%s\n' secondmate
       ;;
     bin/fm-task-inbox-lib.sh)
       # The steering-inbox record/doorbell/ladder owner: fm-send's data plane
