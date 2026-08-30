@@ -765,24 +765,24 @@ The portable classifier regression is `tests/fm-backend-cmux.test.sh`.
 ## Codex CLI launch autonomy
 
 Crewmate autonomy rides `-c 'approval_policy="never"' -c 'sandbox_mode="danger-full-access"'` rather than `--dangerously-bypass-approvals-and-sandbox`, verified on 2026-08-30 with codex-cli 0.147.0 on Linux.
-The TUI parser refuses the launch with exit 2 when `--dangerously-bypass-approvals-and-sandbox` reaches the command line twice, so any environment layer that also supplies the flag (an environment-supplied `codex` entry point that adds it) kills every crewmate spawn.
-The reproduction is self-contained; `/usr/bin/codex` is the real binary and `$tmp/bin/codex` is the stub standing in for a flag-prepending entry point:
+codex exits 2 and refuses the launch when that flag reaches the command line twice, so any environment layer that also supplies it - a `codex` entry point that prepends it to every invocation - kills every crewmate spawn.
+In both blocks below `/usr/bin/codex` is the npm JS shim that execs the vendored native binary, `$tmp/bin/codex` is a stub standing in for such an entry point, and the stub key file is there because an unauthenticated `CODEX_HOME` lands on the "Sign in with ChatGPT" screen.
 
 ```sh
 tmp="$(mktemp -d)"
 mkdir -p "$tmp/home" "$tmp/bin"
-printf 'approval_policy = "never"\nsandbox_mode = "danger-full-access"\n' > "$tmp/home/config.toml"
+printf '{"OPENAI_API_KEY":"sk-stub-not-a-real-key"}\n' > "$tmp/home/auth.json"
 printf '#!/usr/bin/env bash\nexec /usr/bin/codex --dangerously-bypass-approvals-and-sandbox "$@"\n' > "$tmp/bin/codex"
 chmod +x "$tmp/bin/codex"
 
-# duplicate flag, straight at the real binary
-CODEX_HOME="$tmp/home" /usr/bin/codex --dangerously-bypass-approvals-and-sandbox --dangerously-bypass-approvals-and-sandbox "hi"
-
-# duplicate flag, one copy from the launch template and one from the entry point
+# duplicate flag: one copy from the launch template, one from the entry point
 CODEX_HOME="$tmp/home" PATH="$tmp/bin:$PATH" codex --dangerously-bypass-approvals-and-sandbox "hi"
 
-# the shipped launch shape through that same entry point
-CODEX_HOME="$tmp/home" PATH="$tmp/bin:$PATH" codex -c 'approval_policy="never"' -c 'sandbox_mode="danger-full-access"' "hi"
+# the same duplicate straight at the shim
+CODEX_HOME="$tmp/home" /usr/bin/codex --dangerously-bypass-approvals-and-sandbox --dangerously-bypass-approvals-and-sandbox "hi"
+
+# the shipped launch shape through that entry point, with exec in place of the TUI
+CODEX_HOME="$tmp/home" PATH="$tmp/bin:$PATH" codex exec -c 'approval_policy="never"' -c 'sandbox_mode="danger-full-access"' "hi" < /dev/null
 ```
 
 Both duplicate-flag commands exit 2 with:
@@ -791,24 +791,18 @@ Both duplicate-flag commands exit 2 with:
 error: the argument '--dangerously-bypass-approvals-and-sandbox' cannot be used multiple times
 ```
 
-The third command reaches the TUI.
-A config granting both keys together with the flag did not trigger the refusal, and the literal duplicate flag was the only launch-blocking combination observed across the config and flag matrix.
-The override pair is equivalent to the flag: `codex exec` headers reported `approval: never` and `sandbox: danger-full-access` for the flag form, the `-c` form, the `-c` form through an entry point that also adds the flag, and the `-c` form over a config already granting both keys.
-The TUI launched under the `-c` form in all four of those environments, and the crewmate `notify` turn-end override still fired.
-`bin/fm-spawn.sh`'s launch template owns the current command shape, and `tests/fm-spawn-dispatch-profile.test.sh` (`test_codex_autonomy_rides_config_overrides_not_the_bypass_flag`) pins it for both an unconfigured home and a routed home whose config grants autonomy.
+The third is not refused, and its `codex exec` header reports `approval: never` and `sandbox: danger-full-access` before the stub key fails the API call.
+That home's config grants neither key, so the override pair alone carries the unrestricted posture the flag used to.
+`bin/fm-spawn.sh`'s launch template owns the command shape, and `tests/fm-spawn-dispatch-profile.test.sh` (`test_codex_autonomy_rides_config_overrides_not_the_bypass_flag`) pins it for both an unconfigured home and a routed home whose config grants autonomy.
 
-**Directory trust is unchanged by the swap (measured 2026-08-30, codex-cli 0.147.0).**
-The flag's "skip all confirmation prompts" help text does not cover the first-run directory-trust screen, so the swap neither loses nor gains suppression.
-Both shapes were run against `/usr/bin/codex`, the npm JS shim that execs the vendored native binary, so no flag-prepending entry point is on the path, in the same crewmate-shaped linked worktree of a bare repo, each with its own `CODEX_HOME` that had never trusted that root.
-The home must already be authenticated or codex renders the "Sign in with ChatGPT" onboarding screen instead of the trust screen; a stub key file is enough to reach it, so the reproduction needs no real credentials.
-Each launch needs a terminal; this capture used a 45x120 pseudo-terminal.
+**Directory trust is unchanged by the swap.**
+Both forms were run in the same linked worktree of a bare repo, each with its own `CODEX_HOME` that had never trusted that root; the TUI needs a terminal, and this capture used a 45x120 pseudo-terminal.
 
 ```sh
 tmp="$(mktemp -d)"
 mkdir -p "$tmp/flag" "$tmp/overrides" "$tmp/repos" "$tmp/worktrees"
 for home in "$tmp/flag" "$tmp/overrides"; do
   printf '{"OPENAI_API_KEY":"sk-stub-not-a-real-key"}\n' > "$home/auth.json"
-  printf 'approval_policy = "never"\nsandbox_mode = "danger-full-access"\n' > "$home/config.toml"
 done
 
 git init -q --bare "$tmp/repos/x.git"
@@ -823,10 +817,7 @@ CODEX_HOME="$tmp/flag" /usr/bin/codex --dangerously-bypass-approvals-and-sandbox
 CODEX_HOME="$tmp/overrides" /usr/bin/codex -c 'approval_policy="never"' -c 'sandbox_mode="danger-full-access"' "hi"
 ```
 
-Both rendered the identical first screen, `Do you trust the contents of this directory?` with `1. Yes, continue` preselected, so the old flag form stalled an untrusted root exactly as the new form does.
-Trust is state in the selected `CODEX_HOME` config rather than a launch argument, and a linked worktree is no exception: a `[projects."<worktree path>"] trust_level = "trusted"` entry in that home's config suppresses the screen, as does a plain repository root's own entry.
-Accepting the screen with Enter in that worktree wrote `[projects."<repository root named on the screen>"] trust_level = "trusted"`, after which a relaunch in the same worktree and a first launch in a brand-new worktree of the same bare repo both skipped it, matching the per-repo persistence recorded in `.agents/skills/harness-adapters/SKILL.md`.
-The same trust key supplied as a `-c` override on the launch command line did not suppress the screen, so trust stays a `CODEX_HOME` config concern and the launch template carries only the autonomy pair.
+Both rendered the identical first screen, `Do you trust the contents of this directory?` with `1. Yes, continue` preselected, so the flag form stalled an untrusted root exactly as the `-c` form does.
 
 ## Codex App host tools
 
