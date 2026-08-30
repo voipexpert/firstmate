@@ -137,44 +137,82 @@ Expected: The policy parses and the live command immediately reports automatic m
 
 - [ ] **Step 5: Perform a selection-only automatic routing dry run**
 
-Run:
+Derive the repository root and the plan's SDD workspace, then use the controller's file-editing tool to create these two regular fixture files before running the selector.
+Do not use process substitution, named pipes, or any other virtual input path.
 
 ```bash
 cd /home/yaro/work/firstmate
+repo_root=$(git rev-parse --show-toplevel)
+sdd_root="$repo_root/.superpowers/sdd/2026-08-30-firstmate-automatic-routing-activation-implementation"
+request_path="$sdd_root/dry-run-request.json"
+candidates_path="$sdd_root/dry-run-candidates.json"
+```
+
+Create `dry-run-request.json` with this exact content using the file-editing tool:
+
+```json
+{
+  "taskId": "automatic-activation-dry-run",
+  "taskClass": "standard",
+  "workType": "implementation",
+  "risk": "low",
+  "independent": false,
+  "requestedWorkers": 1,
+  "requiredReasoningClass": "strong",
+  "estimatedSeconds": 300
+}
+```
+
+Create `dry-run-candidates.json` with this exact content using the file-editing tool:
+
+```json
+[
+  {
+    "profile": "codex-sol",
+    "harness": "codex",
+    "model": "gpt-5.6-sol",
+    "provider": "openai",
+    "lane": "codex-primary",
+    "account": "codex-primary",
+    "fitTier": 3,
+    "reasoningClass": "strong",
+    "catalogSupported": true,
+    "authState": "usable",
+    "spendPriority": 1,
+    "runwaySeconds": 3600,
+    "activeLane": 0,
+    "historySuccesses": 0,
+    "historyAttempts": 0,
+    "costTier": null
+  }
+]
+```
+
+Confirm that the candidate names the live first default profile before selection:
+
+```bash
+cd /home/yaro/work/firstmate
+repo_root=$(git rev-parse --show-toplevel)
+sdd_root="$repo_root/.superpowers/sdd/2026-08-30-firstmate-automatic-routing-activation-implementation"
+candidates_path="$sdd_root/dry-run-candidates.json"
+routing_profile=$(jq -r '.default[0]' config/crew-dispatch.json)
+candidate_profile=$(jq -r '.[0].profile' "$candidates_path")
+test "$candidate_profile" = "$routing_profile"
+```
+
+Run the selection-only dry run with those regular files:
+
+```bash
+cd /home/yaro/work/firstmate
+repo_root=$(git rev-parse --show-toplevel)
+sdd_root="$repo_root/.superpowers/sdd/2026-08-30-firstmate-automatic-routing-activation-implementation"
+request_path="$sdd_root/dry-run-request.json"
+candidates_path="$sdd_root/dry-run-candidates.json"
 routing_profile=$(jq -r '.default[0]' config/crew-dispatch.json)
 routing_decision=$(
   bin/fm-route.sh select \
-    --request <(jq -n '{
-      taskId:"automatic-activation-dry-run",
-      taskClass:"standard",
-      workType:"implementation",
-      risk:"low",
-      independent:false,
-      requestedWorkers:1,
-      requiredReasoningClass:"strong",
-      estimatedSeconds:300
-    }') \
-    --candidates <(jq -c --arg profile "$routing_profile" '
-      .profiles[$profile] as $candidate
-      | [{
-          profile:$profile,
-          harness:$candidate.harness,
-          model:$candidate.model,
-          provider:$candidate.provider,
-          lane:$candidate.lane,
-          account:($candidate.account // "none"),
-          fitTier:3,
-          reasoningClass:$candidate.reasoningClass,
-          catalogSupported:true,
-          authState:"usable",
-          spendPriority:1,
-          runwaySeconds:3600,
-          activeLane:0,
-          historySuccesses:0,
-          historyAttempts:0,
-          costTier:null
-        }]
-    ' config/crew-dispatch.json)
+    --request "$request_path" \
+    --candidates "$candidates_path"
 )
 jq -e --arg profile "$routing_profile" '
   .action == "selected"
@@ -184,6 +222,7 @@ jq -e --arg profile "$routing_profile" '
 ```
 
 Expected: The selector returns the first eligible default profile without reserving capacity or launching a worker.
+The controller must verify that the fixture files are regular files and may remove them after the dry run.
 
 - [ ] **Step 6: Run the focused routing regression suite after activation**
 
