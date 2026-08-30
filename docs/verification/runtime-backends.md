@@ -799,19 +799,34 @@ The TUI launched under the `-c` form in all four of those environments, and the 
 
 **Directory trust is unchanged by the swap (measured 2026-08-30, codex-cli 0.147.0).**
 The flag's "skip all confirmation prompts" help text does not cover the first-run directory-trust screen, so the swap neither loses nor gains suppression.
-Both shapes were run against `/usr/bin/codex` directly (no flag-prepending entry point), in the same crewmate-shaped git worktree, each with its own `CODEX_HOME` that had never trusted that root, captured through a 45x120 pseudo-terminal:
+Both shapes were run against `/usr/bin/codex`, the npm JS shim that execs the vendored native binary, so no flag-prepending entry point is on the path, in the same crewmate-shaped linked worktree of a bare repo, each with its own `CODEX_HOME` that had never trusted that root.
+The home must already be authenticated or codex renders the "Sign in with ChatGPT" onboarding screen instead of the trust screen; a stub key file is enough to reach it, so the reproduction needs no real credentials.
+Each launch needs a terminal; this capture used a 45x120 pseudo-terminal.
 
 ```sh
-cd <fresh-worktree>
+tmp="$(mktemp -d)"
+mkdir -p "$tmp/flag" "$tmp/overrides" "$tmp/repos" "$tmp/worktrees"
+for home in "$tmp/flag" "$tmp/overrides"; do
+  printf '{"OPENAI_API_KEY":"sk-stub-not-a-real-key"}\n' > "$home/auth.json"
+  printf 'approval_policy = "never"\nsandbox_mode = "danger-full-access"\n' > "$home/config.toml"
+done
+
+git init -q --bare "$tmp/repos/x.git"
+git init -q "$tmp/seed"
+git -C "$tmp/seed" -c user.email=codex@example.invalid -c user.name=codex commit -q --allow-empty -m init
+git -C "$tmp/seed" branch -M main
+git -C "$tmp/seed" push -q "$tmp/repos/x.git" main
+git -C "$tmp/repos/x.git" worktree add -q "$tmp/worktrees/id1" main
+
+cd "$tmp/worktrees/id1"
 CODEX_HOME="$tmp/flag" /usr/bin/codex --dangerously-bypass-approvals-and-sandbox "hi"
 CODEX_HOME="$tmp/overrides" /usr/bin/codex -c 'approval_policy="never"' -c 'sandbox_mode="danger-full-access"' "hi"
 ```
 
 Both rendered the identical first screen, `Do you trust the contents of this directory?` with `1. Yes, continue` preselected, so the old flag form stalled an untrusted root exactly as the new form does.
-Trust itself is config state, not a launch argument: in a plain repository root a `[projects."<root>"] trust_level = "trusted"` entry in the selected `CODEX_HOME` config does suppress the screen.
-It could not be pinned for a linked git worktree on this release.
-Accepting the screen there wrote `[projects."<dir holding the bare repo>"] trust_level = "trusted"` - a path outside the worktree, derived from the worktree `.git` pointer - and the next launch in that same worktree prompted again; entries for the worktree path, that recorded root, the bare repo directory, and their parents, supplied either in the config file or as `-c` overrides, all still prompted.
-So directory trust cannot be granted from the launch boundary in 0.147.0, and the operator Enter recorded in `.agents/skills/harness-adapters/SKILL.md` remains the only accept path, including for a repo whose earlier worktree was already accepted.
+Trust is state in the selected `CODEX_HOME` config rather than a launch argument, and a linked worktree is no exception: a `[projects."<worktree path>"] trust_level = "trusted"` entry in that home's config suppresses the screen, as does a plain repository root's own entry.
+Accepting the screen with Enter in that worktree wrote `[projects."<repository root named on the screen>"] trust_level = "trusted"`, after which a relaunch in the same worktree and a first launch in a brand-new worktree of the same bare repo both skipped it, matching the per-repo persistence recorded in `.agents/skills/harness-adapters/SKILL.md`.
+The same trust key supplied as a `-c` override on the launch command line did not suppress the screen, so trust stays a `CODEX_HOME` config concern and the launch template carries only the autonomy pair.
 
 ## Codex App host tools
 
