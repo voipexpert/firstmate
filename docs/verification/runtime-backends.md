@@ -262,7 +262,7 @@ The CLI matrix was checked directly:
 | --- | --- | --- |
 | Explicit session routing | `herdr <verb> ... --session <name>` | Reached the named session even while another server was running. |
 | Literal send | `herdr pane send-text <pane> <text> --session <name>` | Left text unsubmitted until Enter. |
-| Keys | `herdr pane send-keys <pane> enter | escape | ctrl+c --session <name>` | Enter and Escape worked; Ctrl-C interrupted foreground work. |
+| Keys | `herdr pane send-keys <pane> enter\|escape\|ctrl+c --session <name>` | Enter and Escape worked; Ctrl-C interrupted foreground work. |
 | Capture | `herdr pane read <pane> --source recent --lines N` | Small N could return empty below viewport height; a 200-line request plus local trim was stable. |
 | Native state | `herdr agent get <pane>` | Working and done transitions were visible on some harnesses; live Claude Code 2.1.236 on Herdr 0.8.0 kept `agent_status=idle` for an entire landed turn, including a multi-second tool call, so submit confirmation falls through to the shared composer verdict. Native `busy` remains positive activity evidence, while native `idle` cannot close a turn and the adapter's semantic lifecycle decides worker state. |
 | Restart | guarded named-session stop then start | Workspace, tab, pane, and labels persisted; the agent process and registration did not. |
@@ -456,7 +456,7 @@ HERDR_LAB_HELPER=bin/fm-herdr-lab.sh \
 Observed output on Herdr 0.7.5:
 
 ```text
-ok - old path: the explicit last-pane close of a non-focused workspace stole focus (w3 w3:t1 -> w2 w2:t1)
+ok - old path: the explicit last-pane close of a non-focused workspace stole focus (w3	w3:t1 -> w2	w2:t1)
 ok - mitigation: every in-operation sample preserved exact focus while the doomed workspace was removed
 ok - mitigation: no explicit close and no corrective focus were needed on the defective release
 ok - fallback: a doomed pane holding a persistent child exhausts the proof and takes the plain explicit close
@@ -727,7 +727,7 @@ Current active CLI findings:
 | Fresh readiness | `list-panes --workspace <id> --json --id-format uuids` | Found a brand-new surface before content existed. |
 | Fresh read counterexample | `read-screen` before any write | Returned `internal_error: Failed to read terminal text`. |
 | Literal send | `send --workspace <id> --surface <id> -- <text>` | Left text unsubmitted. |
-| Keys | `send-key ... enter | escape | ctrl-c` | All shared key operations worked. |
+| Keys | `send-key ... enter\|escape\|ctrl-c` | All shared key operations worked. |
 | Nested cwd | `current_directory` plus foreground subshell | Structured cwd froze; the marker-delimited `pwd` probe found the live cwd. |
 | Last surface | `close-surface` on the only surface | Refused with `invalid_state: Cannot close the last surface`. |
 | Last workspace | `close-workspace` on the only workspace in a window | Printed success but left the workspace present. |
@@ -765,25 +765,53 @@ The portable classifier regression is `tests/fm-backend-cmux.test.sh`.
 ## Codex CLI launch autonomy
 
 Crewmate autonomy rides `-c 'approval_policy="never"' -c 'sandbox_mode="danger-full-access"'` rather than `--dangerously-bypass-approvals-and-sandbox`, verified on 2026-08-30 with codex-cli 0.147.0 on Linux.
-The TUI parser refuses the launch with exit 2 when `--dangerously-bypass-approvals-and-sandbox` reaches the command line twice, so any environment layer that also supplies the flag (an environment-supplied `codex` entry point that adds it) kills every crewmate spawn:
+The TUI parser refuses the launch with exit 2 when `--dangerously-bypass-approvals-and-sandbox` reaches the command line twice, so any environment layer that also supplies the flag (an environment-supplied `codex` entry point that adds it) kills every crewmate spawn.
+The reproduction is self-contained; `/usr/bin/codex` is the real binary and `$tmp/bin/codex` is the stub standing in for a flag-prepending entry point:
 
 ```sh
-mkdir -p "$tmp/home"
+tmp="$(mktemp -d)"
+mkdir -p "$tmp/home" "$tmp/bin"
 printf 'approval_policy = "never"\nsandbox_mode = "danger-full-access"\n' > "$tmp/home/config.toml"
-CODEX_HOME="$tmp/home" codex --dangerously-bypass-approvals-and-sandbox "hi"
-CODEX_HOME="$tmp/home" codex -c 'approval_policy="never"' -c 'sandbox_mode="danger-full-access"' "hi"
+printf '#!/usr/bin/env bash\nexec /usr/bin/codex --dangerously-bypass-approvals-and-sandbox "$@"\n' > "$tmp/bin/codex"
+chmod +x "$tmp/bin/codex"
+
+# duplicate flag, straight at the real binary
+CODEX_HOME="$tmp/home" /usr/bin/codex --dangerously-bypass-approvals-and-sandbox --dangerously-bypass-approvals-and-sandbox "hi"
+
+# duplicate flag, one copy from the launch template and one from the entry point
+CODEX_HOME="$tmp/home" PATH="$tmp/bin:$PATH" codex --dangerously-bypass-approvals-and-sandbox "hi"
+
+# the shipped launch shape through that same entry point
+CODEX_HOME="$tmp/home" PATH="$tmp/bin:$PATH" codex -c 'approval_policy="never"' -c 'sandbox_mode="danger-full-access"' "hi"
 ```
 
-Observed for the first command under a duplicate flag:
+Both duplicate-flag commands exit 2 with:
 
 ```text
 error: the argument '--dangerously-bypass-approvals-and-sandbox' cannot be used multiple times
 ```
 
+The third command reaches the TUI.
 A config granting both keys together with the flag did not trigger the refusal, and the literal duplicate flag was the only launch-blocking combination observed across the config and flag matrix.
 The override pair is equivalent to the flag: `codex exec` headers reported `approval: never` and `sandbox: danger-full-access` for the flag form, the `-c` form, the `-c` form through an entry point that also adds the flag, and the `-c` form over a config already granting both keys.
 The TUI launched under the `-c` form in all four of those environments, and the crewmate `notify` turn-end override still fired.
 `bin/fm-spawn.sh`'s launch template owns the current command shape, and `tests/fm-spawn-dispatch-profile.test.sh` (`test_codex_autonomy_rides_config_overrides_not_the_bypass_flag`) pins it for both an unconfigured home and a routed home whose config grants autonomy.
+
+**Directory trust is unchanged by the swap (measured 2026-08-30, codex-cli 0.147.0).**
+The flag's "skip all confirmation prompts" help text does not cover the first-run directory-trust screen, so the swap neither loses nor gains suppression.
+Both shapes were run against `/usr/bin/codex` directly (no flag-prepending entry point), in the same crewmate-shaped git worktree, each with its own `CODEX_HOME` that had never trusted that root, captured through a 45x120 pseudo-terminal:
+
+```sh
+cd <fresh-worktree>
+CODEX_HOME="$tmp/flag" /usr/bin/codex --dangerously-bypass-approvals-and-sandbox "hi"
+CODEX_HOME="$tmp/overrides" /usr/bin/codex -c 'approval_policy="never"' -c 'sandbox_mode="danger-full-access"' "hi"
+```
+
+Both rendered the identical first screen, `Do you trust the contents of this directory?` with `1. Yes, continue` preselected, so the old flag form stalled an untrusted root exactly as the new form does.
+Trust itself is config state, not a launch argument: in a plain repository root a `[projects."<root>"] trust_level = "trusted"` entry in the selected `CODEX_HOME` config does suppress the screen.
+It could not be pinned for a linked git worktree on this release.
+Accepting the screen there wrote `[projects."<dir holding the bare repo>"] trust_level = "trusted"` - a path outside the worktree, derived from the worktree `.git` pointer - and the next launch in that same worktree prompted again; entries for the worktree path, that recorded root, the bare repo directory, and their parents, supplied either in the config file or as `-c` overrides, all still prompted.
+So directory trust cannot be granted from the launch boundary in 0.147.0, and the operator Enter recorded in `.agents/skills/harness-adapters/SKILL.md` remains the only accept path, including for a repo whose earlier worktree was already accepted.
 
 ## Codex App host tools
 
