@@ -1380,10 +1380,14 @@ launch_template() {
       # plus danger-full-access posture, is idempotent over a CODEX_HOME config that
       # already grants those keys, and never collides with an externally supplied
       # flag, so an unconfigured home still launches fully unrestricted.
+      # -c features.hooks=false skips codex-cli 0.147.0's "Hooks need review"
+      # dialog, which otherwise stalls the launch waiting on a captain-only
+      # decision: every firstmate worktree carries tracked primary-session
+      # hooks a worker pane must never trust or run (verified live 2026-08-30).
       if [ "$kind" = secondmate ]; then
-        printf '%s' 'codex __MODELFLAG____EFFORTFLAG__-c '\''approval_policy="never"'\'' -c '\''sandbox_mode="danger-full-access"'\'' "$(__OPINPUT__ encode launch-brief < __BRIEF__)"'
+        printf '%s' 'codex __MODELFLAG____EFFORTFLAG__-c '\''approval_policy="never"'\'' -c '\''sandbox_mode="danger-full-access"'\'' -c '\''features.hooks=false'\'' "$(__OPINPUT__ encode launch-brief < __BRIEF__)"'
       else
-        printf '%s' 'codex __MODELFLAG____EFFORTFLAG__-c '\''approval_policy="never"'\'' -c '\''sandbox_mode="danger-full-access"'\'' -c "notify=[\"bash\",\"-c\",\"touch __TURNEND__\"]" "$(__OPINPUT__ encode launch-brief < __BRIEF__)"'
+        printf '%s' 'codex __MODELFLAG____EFFORTFLAG__-c '\''approval_policy="never"'\'' -c '\''sandbox_mode="danger-full-access"'\'' -c '\''features.hooks=false'\'' -c "notify=[\"bash\",\"-c\",\"touch __TURNEND__\"]" "$(__OPINPUT__ encode launch-brief < __BRIEF__)"'
       fi
       ;;
     opencode) printf '%s' 'OPENCODE_CONFIG_CONTENT='\''{"permission":{"*":"allow"}}'\'' opencode __MODELFLAG__--prompt "$(__OPINPUT__ encode launch-brief < __BRIEF__)"' ;;

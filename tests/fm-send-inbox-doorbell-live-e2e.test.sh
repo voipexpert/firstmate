@@ -83,7 +83,7 @@ harness_version() {  # <binary>
 launch_cmd() {  # <name>
   case "$1" in
     claude) printf '%s' 'CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false claude --dangerously-skip-permissions' ;;
-    codex) printf '%s' 'codex -c '\''approval_policy="never"'\'' -c '\''sandbox_mode="danger-full-access"'\''' ;;
+    codex) printf '%s' 'codex -c '\''approval_policy="never"'\'' -c '\''sandbox_mode="danger-full-access"'\'' -c '\''features.hooks=false'\''' ;;
     opencode) printf '%s' "OPENCODE_CONFIG_CONTENT='{\"permission\":{\"*\":\"allow\"}}' opencode" ;;
     pi|pi-signed) printf '%s' "$1" ;;
     grok) printf '%s' 'grok --always-approve' ;;

@@ -410,7 +410,7 @@ test_active_dispatch_profile_allows_explicit_harness() {
   assert_contains "$out" "spawned $id harness=codex" "spawn did not report explicit codex harness"
   assert_meta_profile "$HOME_DIR/state/$id.meta" codex gpt-5 high
   launch=$(cat "$LAUNCH_LOG")
-  assert_contains "$launch" "codex --model 'gpt-5' -c 'model_reasoning_effort=\"high\"' -c 'approval_policy=\"never\"' -c 'sandbox_mode=\"danger-full-access\"'" \
+  assert_contains "$launch" "codex --model 'gpt-5' -c 'model_reasoning_effort=\"high\"' -c 'approval_policy=\"never\"' -c 'sandbox_mode=\"danger-full-access\"' -c 'features.hooks=false'" \
     "explicit harness launch did not thread model and effort"
   pass "active crew-dispatch profile allows an explicit resolved harness"
 }
@@ -477,7 +477,7 @@ test_codex_threads_model_and_effort() {
   expect_code 0 "$status" "codex spawn with profile flags should succeed"
   assert_meta_profile "$HOME_DIR/state/$id.meta" codex gpt-5 high
   launch=$(cat "$LAUNCH_LOG")
-  assert_contains "$launch" "codex --model 'gpt-5' -c 'model_reasoning_effort=\"high\"' -c 'approval_policy=\"never\"' -c 'sandbox_mode=\"danger-full-access\"'" \
+  assert_contains "$launch" "codex --model 'gpt-5' -c 'model_reasoning_effort=\"high\"' -c 'approval_policy=\"never\"' -c 'sandbox_mode=\"danger-full-access\"' -c 'features.hooks=false'" \
     "codex launch did not thread model and reasoning effort config"
   pass "codex receives --model and model_reasoning_effort profile flags"
 }
@@ -493,7 +493,7 @@ test_codex_omits_invalid_max_effort() {
   expect_code 0 "$status" "codex spawn with unsupported max effort should omit the effort flag"
   assert_meta_profile "$HOME_DIR/state/$id.meta" codex gpt-5 max
   launch=$(cat "$LAUNCH_LOG")
-  assert_contains "$launch" "codex --model 'gpt-5' -c 'approval_policy=\"never\"' -c 'sandbox_mode=\"danger-full-access\"'" \
+  assert_contains "$launch" "codex --model 'gpt-5' -c 'approval_policy=\"never\"' -c 'sandbox_mode=\"danger-full-access\"' -c 'features.hooks=false'" \
     "codex launch did not preserve the model flag when max effort was omitted"
   assert_not_contains "$launch" "model_reasoning_effort" "codex launch must omit unsupported max reasoning effort"
   pass "codex omits unsupported max effort instead of passing a bad config value"
@@ -514,7 +514,7 @@ test_codex_autonomy_rides_config_overrides_not_the_bypass_flag() {
   launch=$(cat "$LAUNCH_LOG")
   assert_not_contains "$launch" "--dangerously-bypass-approvals-and-sandbox" \
     "codex launch must not pass the bypass flag: codex-cli 0.147.0 refuses the TUI launch when the flag reaches the command line twice, and an external codex entry point may already supply it"
-  assert_contains "$launch" "-c 'approval_policy=\"never\"' -c 'sandbox_mode=\"danger-full-access\"'" \
+  assert_contains "$launch" "-c 'approval_policy=\"never\"' -c 'sandbox_mode=\"danger-full-access\"' -c 'features.hooks=false'" \
     "codex launch must grant unattended unrestricted operation through config overrides"
 
   # Configured Codex home: the selected CODEX_HOME config already grants both
@@ -536,7 +536,7 @@ test_codex_autonomy_rides_config_overrides_not_the_bypass_flag() {
   assert_contains "$launch" "CODEX_HOME='$HOME_DIR/codex-2'" "Codex secondary account was not selected"
   assert_not_contains "$launch" "--dangerously-bypass-approvals-and-sandbox" \
     "codex launch must not duplicate autonomy the selected Codex config already grants"
-  assert_contains "$launch" "-c 'approval_policy=\"never\"' -c 'sandbox_mode=\"danger-full-access\"'" \
+  assert_contains "$launch" "-c 'approval_policy=\"never\"' -c 'sandbox_mode=\"danger-full-access\"' -c 'features.hooks=false'" \
     "codex launch must keep unrestricted operation idempotent over a granting config"
   pass "codex autonomy rides config overrides, never the duplicate-prone bypass flag"
 }

@@ -819,6 +819,25 @@ CODEX_HOME="$tmp/overrides" /usr/bin/codex -c 'approval_policy="never"' -c 'sand
 
 Both rendered the identical first screen, `Do you trust the contents of this directory?` with `1. Yes, continue` preselected, so the flag form stalled an untrusted root exactly as the `-c` form does.
 
+### Hooks review dialog
+
+Codex 0.147.0 stops crewmate and secondmate launches on a `Hooks need review` dialog whenever the worktree carries tracked hook config, because every firstmate worktree ships `.codex/hooks.json` with PRIMARY-session hooks a crew or secondmate pane must never trust or run.
+Unanswered, the dialog leaves the brief unread and the pane looks wedged to supervision; it was observed live on 2026-08-30 against a spawned codex canary.
+Both codex launch templates in `bin/fm-spawn.sh` now add `-c 'features.hooks=false'`, confirmed on 2026-08-30 against the same installed build as the documented spelling for disabling the `hooks` feature:
+
+```sh
+$ codex --version
+codex-cli 0.147.0
+$ codex features list | grep -w hooks
+hooks                                stable             true
+$ codex --help | grep -A1 -- '--disable <FEATURE>'
+      --disable <FEATURE>
+          Disable a feature (repeatable). Equivalent to `-c features.<name>=false`
+```
+
+A separate isolated exact-launch probe on this same codex-cli build confirmed the fix end to end: the `Hooks need review` dialog was skipped, the agent executed unrestricted, it replied a fixed marker, and the launch template's `notify` callback still fired.
+`tests/fm-spawn-dispatch-profile.test.sh` and `tests/fm-secondmate-harness.test.sh` pin the composed override for both templates.
+
 ## Codex App host tools
 
 A reusable Desktop host-tool smoke ran on 2026-07-06 against Codex Desktop bundle version 26.623.101652, build 4674, bundle id `com.openai.codex`.
