@@ -262,7 +262,7 @@ The CLI matrix was checked directly:
 | --- | --- | --- |
 | Explicit session routing | `herdr <verb> ... --session <name>` | Reached the named session even while another server was running. |
 | Literal send | `herdr pane send-text <pane> <text> --session <name>` | Left text unsubmitted until Enter. |
-| Keys | `herdr pane send-keys <pane> enter|escape|ctrl+c --session <name>` | Enter and Escape worked; Ctrl-C interrupted foreground work. |
+| Keys | `herdr pane send-keys <pane> enter\|escape\|ctrl+c --session <name>` | Enter and Escape worked; Ctrl-C interrupted foreground work. |
 | Capture | `herdr pane read <pane> --source recent --lines N` | Small N could return empty below viewport height; a 200-line request plus local trim was stable. |
 | Native state | `herdr agent get <pane>` | Working and done transitions were visible on some harnesses; live Claude Code 2.1.236 on Herdr 0.8.0 kept `agent_status=idle` for an entire landed turn, including a multi-second tool call, so submit confirmation falls through to the shared composer verdict. Native `busy` remains positive activity evidence, while native `idle` cannot close a turn and the adapter's semantic lifecycle decides worker state. |
 | Restart | guarded named-session stop then start | Workspace, tab, pane, and labels persisted; the agent process and registration did not. |
@@ -488,7 +488,7 @@ Default-on presentation projection is floored at Herdr 0.8.0.
 The floor's structural signal is the selected running server's protocol number, falling back to the client protocol only when that selected session positively reports no running server, and the release mapping was measured on 2026-08-05 by running each pinned upstream macOS aarch64 release asset's own `status --json` through the guarded lab helper:
 
 | Release | Reported version | Protocol | Carries both upstream focus fixes | Floor verdict |
-|---|---|---|---|---|
+| --- | --- | --- | --- | --- |
 | v0.7.3 | 0.7.3 | 16 | no | below |
 | v0.7.4 | 0.7.4 | 16 | no | below |
 | v0.7.5 | 0.7.5 | 17 | no | below |
@@ -727,7 +727,7 @@ Current active CLI findings:
 | Fresh readiness | `list-panes --workspace <id> --json --id-format uuids` | Found a brand-new surface before content existed. |
 | Fresh read counterexample | `read-screen` before any write | Returned `internal_error: Failed to read terminal text`. |
 | Literal send | `send --workspace <id> --surface <id> -- <text>` | Left text unsubmitted. |
-| Keys | `send-key ... enter|escape|ctrl-c` | All shared key operations worked. |
+| Keys | `send-key ... enter\|escape\|ctrl-c` | All shared key operations worked. |
 | Nested cwd | `current_directory` plus foreground subshell | Structured cwd froze; the marker-delimited `pwd` probe found the live cwd. |
 | Last surface | `close-surface` on the only surface | Refused with `invalid_state: Cannot close the last surface`. |
 | Last workspace | `close-workspace` on the only workspace in a window | Printed success but left the workspace present. |
@@ -761,6 +761,63 @@ FM_CMUX_CLAUDE_COMPOSER_LIVE=1 bin/fm-test-run.sh tests/fm-cmux-claude-composer-
 
 That guard still addresses the worker by task selector, so it no longer reaches the typed submit path and is not a current refresh entry point for this guarantee.
 The portable classifier regression is `tests/fm-backend-cmux.test.sh`.
+
+## Codex CLI launch autonomy
+
+Codex crewmate and secondmate autonomy rides `-c 'approval_policy="never"' -c 'sandbox_mode="danger-full-access"'` rather than `--dangerously-bypass-approvals-and-sandbox`, verified on 2026-08-30 with codex-cli 0.147.0 on Linux.
+codex exits 2 and refuses the launch when that flag reaches the command line twice, so any environment layer that also supplies it - a `codex` entry point that prepends it to every invocation - kills every codex spawn.
+In both blocks below `/usr/bin/codex` is the npm JS shim that execs the vendored native binary, `$tmp/bin/codex` is a stub standing in for such an entry point, and the stub key file is there because an unauthenticated `CODEX_HOME` lands on the "Sign in with ChatGPT" screen.
+
+```sh
+tmp="$(mktemp -d)"
+mkdir -p "$tmp/home" "$tmp/bin"
+printf '{"OPENAI_API_KEY":"sk-stub-not-a-real-key"}\n' > "$tmp/home/auth.json"
+printf '#!/usr/bin/env bash\nexec /usr/bin/codex --dangerously-bypass-approvals-and-sandbox "$@"\n' > "$tmp/bin/codex"
+chmod +x "$tmp/bin/codex"
+
+# duplicate flag: one copy from the launch template, one from the entry point
+CODEX_HOME="$tmp/home" PATH="$tmp/bin:$PATH" codex --dangerously-bypass-approvals-and-sandbox "hi"
+
+# the same duplicate straight at the shim
+CODEX_HOME="$tmp/home" /usr/bin/codex --dangerously-bypass-approvals-and-sandbox --dangerously-bypass-approvals-and-sandbox "hi"
+
+# the shipped launch shape through that entry point, with exec in place of the TUI
+CODEX_HOME="$tmp/home" PATH="$tmp/bin:$PATH" codex exec -c 'approval_policy="never"' -c 'sandbox_mode="danger-full-access"' "hi" < /dev/null
+```
+
+Both duplicate-flag commands exit 2 with:
+
+```text
+error: the argument '--dangerously-bypass-approvals-and-sandbox' cannot be used multiple times
+```
+
+The third is not refused, and its `codex exec` header reports `approval: never` and `sandbox: danger-full-access` before the stub key fails the API call.
+That home's config grants neither key, so the override pair alone carries the unrestricted posture the flag used to.
+`bin/fm-spawn.sh`'s two codex launch templates own the command shape; `tests/fm-spawn-dispatch-profile.test.sh` (`test_codex_autonomy_rides_config_overrides_not_the_bypass_flag`) pins the crewmate shape for both an unconfigured home and a routed home whose config grants autonomy, and `tests/fm-secondmate-harness.test.sh` pins the secondmate shape.
+
+**Directory trust is unchanged by the swap.**
+Both forms were run in the same linked worktree of a bare repo, each with its own `CODEX_HOME` that had never trusted that root; the TUI needs a terminal, and this capture used a 45x120 pseudo-terminal.
+
+```sh
+tmp="$(mktemp -d)"
+mkdir -p "$tmp/flag" "$tmp/overrides" "$tmp/repos" "$tmp/worktrees"
+for home in "$tmp/flag" "$tmp/overrides"; do
+  printf '{"OPENAI_API_KEY":"sk-stub-not-a-real-key"}\n' > "$home/auth.json"
+done
+
+git init -q --bare "$tmp/repos/x.git"
+git init -q "$tmp/seed"
+git -C "$tmp/seed" -c user.email=codex@example.invalid -c user.name=codex commit -q --allow-empty -m init
+git -C "$tmp/seed" branch -M main
+git -C "$tmp/seed" push -q "$tmp/repos/x.git" main
+git -C "$tmp/repos/x.git" worktree add -q "$tmp/worktrees/id1" main
+
+cd "$tmp/worktrees/id1"
+CODEX_HOME="$tmp/flag" /usr/bin/codex --dangerously-bypass-approvals-and-sandbox "hi"
+CODEX_HOME="$tmp/overrides" /usr/bin/codex -c 'approval_policy="never"' -c 'sandbox_mode="danger-full-access"' "hi"
+```
+
+Both rendered the identical first screen, `Do you trust the contents of this directory?` with `1. Yes, continue` preselected, so the flag form stalled an untrusted root exactly as the `-c` form does.
 
 ## Codex App host tools
 
