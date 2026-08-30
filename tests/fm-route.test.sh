@@ -1869,6 +1869,76 @@ test_finalize_recovers_between_ledger_publish_and_reservation_delete() {
   pass "finalize reconciles the ledger-published reservation-delete crash window"
 }
 
+test_cleanup_finalize_without_score_never_fabricates_a_completion_timestamp() {
+  local metadata="$FM_STATE_OVERRIDE/never-scored.meta" reservation created_at before after outcome elapsed
+  reset_route_state
+  reserve_route never-scored gen-1 profile-1 openai codex-primary codex-primary standard medium automatic >/dev/null
+  activate_fresh_admission never-scored gen-1 "$metadata" >/dev/null
+  reservation=$(reservation_path never-scored gen-1)
+  jq -e '.score == null' "$reservation" >/dev/null || fail "fixture unexpectedly carried a score"
+  # Anchor createdAt to a real wall-clock time in the past (like the canary evidence's ~13-minute
+  # run) rather than the fixture's default fake epoch, so a real elapsed-time assertion is possible.
+  # No --tests/--review score is ever recorded before cleanup finalizes this task, matching the
+  # normal dispatch/cleanup lifecycle path fm-teardown.sh drives for every routed task.
+  created_at=$(( $(date +%s) - 780 ))
+  jq --argjson createdAt "$created_at" '.createdAt = $createdAt' "$reservation" >"$reservation.next"
+  mv "$reservation.next" "$reservation"
+  before=$(date +%s)
+  outcome=$(cleanup_finalize never-scored gen-1 completed) || fail "no-score cleanup finalization failed"
+  after=$(date +%s)
+  # Legitimate contract: unknown/unknown/no is still what a never-scored task reports (AGENTS.md
+  # 'unknown' is explicitly legal), so the finalize path must not wedge or refuse this task.
+  jq -e '.tests == "unknown" and .review == "unknown" and .redundant == "no"' <<<"$outcome" >/dev/null \
+    || fail "never-scored finalization did not preserve the legal unknown/unknown/no default"
+  # The bug: elapsedSeconds was computed from score.timestamp defaulted to the reservation's own
+  # createdAt, which always yields exactly 0 regardless of how long the task actually ran.
+  elapsed=$(jq -r .elapsedSeconds <<<"$outcome")
+  [ "$elapsed" -ne 0 ] \
+    || fail "never-scored finalization fabricated a zero elapsedSeconds instead of reporting the real duration"
+  # elapsedSeconds must fall within the honest wall-clock window this finalize call actually ran in.
+  [ "$elapsed" -ge $((before - created_at)) ] || fail "elapsedSeconds is not honest: $elapsed"
+  [ "$elapsed" -le $((after - created_at)) ] || fail "elapsedSeconds overshoots the honest window: $elapsed"
+  # Never-scored must be distinguishable from a deliberately recorded unknown score.
+  jq -e '.scored == false' <<<"$outcome" >/dev/null \
+    || fail "never-scored finalization did not mark the record scored:false"
+  pass "cleanup finalization without a score reports an honest duration and marks the record unscored"
+}
+
+test_cleanup_finalize_distinguishes_never_scored_from_deliberate_unknown_score() {
+  local metadata_a="$FM_STATE_OVERRIDE/never-scored-b.meta" metadata_b="$FM_STATE_OVERRIDE/deliberate-b.meta"
+  local reservation_a reservation_b outcome_a outcome_b
+  reset_route_state
+  reserve_route never-scored-b gen-1 profile-1 openai codex-primary codex-primary standard medium automatic >/dev/null
+  activate_fresh_admission never-scored-b gen-1 "$metadata_a" >/dev/null
+  reservation_a=$(reservation_path never-scored-b gen-1)
+  jq '.createdAt -= 60' "$reservation_a" >"$reservation_a.next"
+  mv "$reservation_a.next" "$reservation_a"
+  outcome_a=$(cleanup_finalize never-scored-b gen-1 completed) || fail "never-scored cleanup finalization failed"
+
+  reserve_route deliberate-b gen-1 profile-1 openai codex-primary codex-primary standard medium automatic >/dev/null
+  activate_fresh_admission deliberate-b gen-1 "$metadata_b" >/dev/null
+  reservation_b=$(reservation_path deliberate-b gen-1)
+  jq '.createdAt -= 60' "$reservation_b" >"$reservation_b.next"
+  mv "$reservation_b.next" "$reservation_b"
+  "$ROUTE" score --task deliberate-b --generation gen-1 --terminal completed \
+    --tests unknown --review unknown --redundant no --now "$(date +%s)" >/dev/null
+  outcome_b=$("$ROUTE" cleanup-finalize --task deliberate-b --generation gen-1 \
+    --profile profile-1 --provider openai --lane codex-primary --account codex-primary \
+    --class standard --work-type implementation --risk medium --mode automatic \
+    --terminal completed) || fail "deliberately-scored cleanup finalization failed"
+
+  # Both records legitimately share the same tests/review/redundant/terminal evidence today,
+  # so those fields alone cannot tell "never scored" apart from a deliberate unknown score.
+  jq -ne --argjson a "$outcome_a" --argjson b "$outcome_b" \
+    '$a.tests == $b.tests and $a.review == $b.review and $a.redundant == $b.redundant and $a.terminal == $b.terminal' \
+    >/dev/null || fail "fixture setup did not produce matching tests/review/redundant/terminal evidence"
+  jq -e '.scored == false' <<<"$outcome_a" >/dev/null \
+    || fail "never-scored outcome did not mark scored:false"
+  jq -e '.scored != false' <<<"$outcome_b" >/dev/null \
+    || fail "deliberately-scored outcome was incorrectly marked scored:false"
+  pass "never-scored and deliberately-scored-unknown finalizations are distinguishable in the outcome record"
+}
+
 test_observe_and_ledger_schemas_are_exact_and_sanitized() {
   local decision before after
   reset_route_state
@@ -1980,6 +2050,8 @@ test_cleanup_preflight_rejects_missing_capability_and_corrupt_journal
 test_cleanup_preflight_recovers_stale_admission_before_finalizing
 test_observation_evidence_status_and_report_are_non_mutating
 test_finalize_recovers_between_ledger_publish_and_reservation_delete
+test_cleanup_finalize_without_score_never_fabricates_a_completion_timestamp
+test_cleanup_finalize_distinguishes_never_scored_from_deliberate_unknown_score
 test_observe_and_ledger_schemas_are_exact_and_sanitized
 test_status_exposes_complete_capacity_and_breaker_policy
 test_every_single_value_option_rejects_duplicates
