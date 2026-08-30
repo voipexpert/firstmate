@@ -514,6 +514,8 @@ test_codex_autonomy_rides_config_overrides_not_the_bypass_flag() {
   launch=$(cat "$LAUNCH_LOG")
   assert_not_contains "$launch" "--dangerously-bypass-approvals-and-sandbox" \
     "codex launch must not pass the bypass flag: codex-cli 0.147.0 refuses the TUI launch when the flag reaches the command line twice, and an external codex entry point may already supply it"
+  assert_not_contains "$launch" "--dangerously-" \
+    "no codex crewmate/scout launch may carry ANY bare --dangerously-* flag, because codex-cli 0.147.0 exits 2 with 'cannot be used multiple times' when an entry point supplies the same flag; the secondmate template's --dangerously-bypass-hook-trust is the single deliberate exception and is recorded as an accepted residual in docs/verification/runtime-backends.md"
   assert_contains "$launch" "-c 'approval_policy=\"never\"' -c 'sandbox_mode=\"danger-full-access\"' -c 'features.hooks=false'" \
     "codex launch must grant unattended unrestricted operation through config overrides"
 

@@ -1387,12 +1387,28 @@ launch_template() {
       # A secondmate is a controlled Firstmate primary: its hook source is this
       # repo's own tracked .codex/hooks.json, and a valid .fm-secondmate-home
       # marker puts the home in primary scope (bin/fm-primary-scope-lib.sh), so
-      # it must KEEP its turn-end guard and its arm/cd PreToolUse seatbelts.
-      # --dangerously-bypass-hook-trust skips the dialog with the engine on.
-      # A crewmate or scout instead runs in an isolated task worktree whose
-      # branch may carry unvetted edits to .codex/hooks.json itself, so it must
-      # never auto-trust that file: -c features.hooks=false turns the engine
-      # off. That is not free. It also drops bin/fm-arm-pretool-check.sh, the
+      # it must not have its hooks engine switched off wholesale.
+      # --dangerously-bypass-hook-trust clears the dialog and leaves the engine
+      # installed. It does NOT by itself mark an untrusted hook active: on
+      # 0.147.0 /hooks still reports the tracked entry Installed=1 Active=0
+      # Review=1 under the flag, and only persisted trust reaches Active=1, so
+      # do not read this template as a guarantee that the secondmate's guards
+      # run (docs/verification/runtime-backends.md "Hooks review dialog").
+      # This is the one deliberate bare --dangerously-* flag in a codex
+      # template, against the collision rule above, because the config spelling
+      # does not exist on this build: -c 'bypass_hook_trust=true' is accepted
+      # silently and changes nothing, leaving the launch parked on the dialog.
+      # The residual is accepted rather than fixed: a codex entry point that
+      # also prepends this flag makes every secondmate spawn die at exit 2
+      # ("cannot be used multiple times"), so no shipped entry point may add it.
+      # A crewmate or scout instead runs in a linked task worktree, and on
+      # 0.147.0 codex resolves project hooks from the MAIN checkout rather than
+      # the cwd: with cwd set to a linked worktree it loads the main worktree's
+      # .codex/hooks.json and ignores the linked worktree's own copy entirely.
+      # The file a crew pane would be asked to trust is therefore the captain's
+      # PRIMARY-session hook set, which a worker must never trust or run, so
+      # -c features.hooks=false turns the engine off. That is not free. It also
+      # drops bin/fm-arm-pretool-check.sh, the
       # one tracked codex hook with no primary-scope test and therefore the one
       # that would otherwise fire in a linked worktree, so a codex crew pane
       # loses the broad-watcher-kill and watcher-arm anti-pattern denials a

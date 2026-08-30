@@ -119,7 +119,18 @@ check_harness_idle_empty() {  # <name> <launch-cmd...>
 # --- 1. Every installed verified harness must reach a proven-empty composer --
 for h in claude codex opencode pi grok kimi muse; do
   if command -v "$h" >/dev/null 2>&1; then
-    check_harness_idle_empty "$h" "$h"
+    case "$h" in
+      # codex 0.147.0 parks on a blocking "Hooks need review" dialog whenever the
+      # cwd carries tracked hook config, and $ROOT carries this repo's own
+      # .codex/hooks.json. The mid-budget Escape below cannot clear it, because
+      # that dismissal is gated on a 'trust' match and the hooks dialog is
+      # deliberately excluded from it, so the composer is never reached. This
+      # probe is a throwaway worktree that must not trust repo-controlled hooks,
+      # so it launches with the same hooks-off override the crewmate template
+      # uses (docs/verification/runtime-backends.md "Hooks review dialog").
+      codex) check_harness_idle_empty "$h" "$h" -c 'features.hooks=false' ;;
+      *) check_harness_idle_empty "$h" "$h" ;;
+    esac
   else
     note "harness absent, not verified here: $h"
   fi
