@@ -1384,6 +1384,14 @@ launch_template() {
       # dialog, which otherwise stalls the launch waiting on a captain-only
       # decision: every firstmate worktree carries tracked primary-session
       # hooks a worker pane must never trust or run (verified live 2026-08-30).
+      # It is free for a crewmate or scout, whose linked task worktree is
+      # already outside primary scope, and a deliberate tradeoff for a
+      # secondmate, whose marked home IS in primary scope and therefore runs
+      # with no turn-end guard and no arm/cd seatbelts; docs/turnend-guard.md
+      # owns that contract. It also gates fm_busy_codex_hooks_verified in
+      # bin/fm-busy-lib.sh: opening that busy gate means revisiting this
+      # override, because hooks-off would silence the very lifecycle hooks the
+      # gate arms.
       if [ "$kind" = secondmate ]; then
         printf '%s' 'codex __MODELFLAG____EFFORTFLAG__-c '\''approval_policy="never"'\'' -c '\''sandbox_mode="danger-full-access"'\'' -c '\''features.hooks=false'\'' "$(__OPINPUT__ encode launch-brief < __BRIEF__)"'
       else

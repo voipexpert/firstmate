@@ -230,6 +230,7 @@ Accept with Enter.
 The decision persists for the repo, so later worktrees of the same project skip it.
 
 Codex 0.147.0 also stops crew and secondmate launches on a `Hooks need review` dialog whenever the worktree carries tracked hook config, since every firstmate worktree ships PRIMARY-session hooks a worker pane must never trust or run; both codex launch templates carry `-c 'features.hooks=false'` to skip it (`docs/verification/runtime-backends.md` "Hooks review dialog").
+For a crewmate or scout that costs nothing, because their linked task worktrees are already out of primary scope. For a secondmate it is a real tradeoff: a marked secondmate home IS in primary scope, so that pane deliberately runs with no turn-end guard, no session-start digest, and no arm/cd PreToolUse seatbelts; `docs/turnend-guard.md` owns that contract and pi is the stronger secondmate harness where the backstop matters.
 
 Resume after exit with `codex resume <session-id>`.
 The session id is printed on quit.

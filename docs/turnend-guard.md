@@ -51,6 +51,11 @@ If `jq` is missing or hook stdin is empty, the guard exits 0 because it cannot s
 
 - Claude registers two `Stop` hooks in `.claude/settings.json`, both anchored through `CLAUDE_PROJECT_DIR`: `bin/fm-turnend-guard.sh --claude`, and `bin/fm-claude-stop-autoarm.sh` with `asyncRewake: true` and `timeout: 28800`.
 - Codex registers a `Stop` hook in `.codex/hooks.json`, anchors the executable to the hook process working directory, verifies a Firstmate-shaped hook-bearing root, and passes the original payload to the shared guard.
+  A firstmate-launched codex secondmate is the one deliberate exception to this registration.
+  `bin/fm-spawn.sh` launches both codex worker templates with `-c 'features.hooks=false'` to clear codex 0.147.0's `Hooks need review` dialog, which otherwise stalls the launch on a decision no worker pane may take, so no tracked `.codex/hooks.json` entry fires in that pane even though a valid `.fm-secondmate-home` marker puts the home in primary scope.
+  That home therefore has no Stop-blocking backstop and no `PreToolUse` seatbelt; its supervision rests entirely on the pull warning `bin/fm-guard.sh` and the foreground checkpoint protocol in [`supervision-protocols/codex.md`](supervision-protocols/codex.md).
+  A codex secondmate is consequently a weaker primary than a pi secondmate, whose template loads `.pi/extensions/fm-primary-turnend-guard.ts` explicitly; prefer pi for a secondmate home that must keep the turn-end backstop.
+  The launch fact and its live evidence are recorded in [`verification/runtime-backends.md`](verification/runtime-backends.md) "Hooks review dialog"; reversing it requires a codex build that scopes hook trust per launch.
 - OpenCode listens for `session.idle` in `.opencode/plugins/fm-primary-turnend-guard.js`, lets the watcher coordinator act first, and calls `client.session.promptAsync` once when the guard returns 2.
 - Pi listens for `agent_settled` in `.pi/extensions/fm-primary-turnend-guard.ts`, runs once per logical agent run, and calls `pi.sendUserMessage(..., { deliverAs: "followUp" })` once when the guard returns 2.
 - Cursor registers a `stop` hook in `.cursor/hooks.json` and delegates the whole turn boundary to `bin/fm-turnend-guard-cursor.sh`, the park described below.

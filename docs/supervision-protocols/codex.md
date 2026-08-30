@@ -10,6 +10,7 @@ When this session owns supervision and away mode is not active:
 6. Never use shell `&` or Codex background tasks for firstmate watcher supervision.
 7. Do not run `bin/fm-watch-arm.sh` as Codex's normal supervision command.
    If it is ever shelled anyway, a backgrounded, piped, or bundled anti-pattern is denied automatically by the PreToolUse seatbelt (`bin/fm-arm-pretool-check.sh`) registered in `.codex/hooks.json`.
+   That seatbelt is absent in a firstmate-launched codex secondmate pane, which `bin/fm-spawn.sh` launches with `-c 'features.hooks=false'` so codex 0.147.0's `Hooks need review` dialog cannot stall it (`docs/turnend-guard.md`), so in that pane this rule is self-enforced and nothing will deny the anti-pattern for you.
 8. Failure or missing cycle only: drain queued wakes, inspect the failure, then start a fresh foreground checkpoint.
 
 Codex cannot reason while a foreground tool call is running.

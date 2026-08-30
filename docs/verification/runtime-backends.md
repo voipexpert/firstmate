@@ -838,6 +838,16 @@ $ codex --help | grep -A1 -- '--disable <FEATURE>'
 A separate isolated exact-launch probe on this same codex-cli build confirmed the fix end to end: the `Hooks need review` dialog was skipped, the agent executed unrestricted, it replied a fixed marker, and the launch template's `notify` callback still fired.
 `tests/fm-spawn-dispatch-profile.test.sh` and `tests/fm-secondmate-harness.test.sh` pin the composed override for both templates.
 
+Two consequences are deliberate and recorded elsewhere so neither can drift silently.
+
+For a crewmate or scout the override costs nothing, because a linked task worktree already fails the git-dir primary-scope test and those hooks would be inert anyway.
+For a secondmate it is a real tradeoff: a valid `.fm-secondmate-home` marker force-includes that home in primary scope (`bin/fm-primary-scope-lib.sh`), so the pane deliberately runs with no Stop turn-end guard, no session-start digest, and no arm/cd `PreToolUse` seatbelts.
+`docs/turnend-guard.md` owns that contract, and `docs/supervision-protocols/codex.md` and `docs/cd-guard.md` carry the matching qualifications.
+Prefer a pi secondmate where the turn-end backstop must hold, since its template loads the primary extensions explicitly.
+
+The dialog is also direct evidence that the 0.145.0 semantic-busy verdict recorded in [`supervision.md`](supervision.md) - that firstmate-written project hooks under `<worktree>/.codex/` never fired - is version-scoped and no longer describes 0.147.0, which plainly does load them in the TUI.
+That verdict was never re-probed on this build, so `fm_busy_codex_hooks_verified` in `bin/fm-busy-lib.sh` stays closed; the comment there records that opening it requires revisiting this launch override first, because hooks-off would silence the very lifecycle hooks the gate arms and leave a worker's busy record unsettled with no error surfaced.
+
 ## Codex App host tools
 
 A reusable Desktop host-tool smoke ran on 2026-07-06 against Codex Desktop bundle version 26.623.101652, build 4674, bundle id `com.openai.codex`.

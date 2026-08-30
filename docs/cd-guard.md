@@ -31,6 +31,7 @@ The checkout must also carry `AGENTS.md` and `bin/`, and any failure to confirm 
 
 The cd-guard does not inspect `.fm-secondmate-home`.
 It therefore applies in a git-cloned secondmate home where git-dir equals git-common-dir, but remains inert in a treehouse-leased secondmate home that is itself a linked worktree.
+Under a codex secondmate that scope never gets a chance to run: `bin/fm-spawn.sh` launches codex workers with `-c 'features.hooks=false'`, so no tracked `.codex/hooks.json` entry fires in that pane (`docs/turnend-guard.md`).
 Secondmate child crew and scout worktrees are likewise inert under the linked-worktree test.
 
 ## Block vs allow
