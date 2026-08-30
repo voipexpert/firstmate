@@ -262,7 +262,7 @@ The CLI matrix was checked directly:
 | --- | --- | --- |
 | Explicit session routing | `herdr <verb> ... --session <name>` | Reached the named session even while another server was running. |
 | Literal send | `herdr pane send-text <pane> <text> --session <name>` | Left text unsubmitted until Enter. |
-| Keys | `herdr pane send-keys <pane> enter|escape|ctrl+c --session <name>` | Enter and Escape worked; Ctrl-C interrupted foreground work. |
+| Keys | `herdr pane send-keys <pane> enter | escape | ctrl+c --session <name>` | Enter and Escape worked; Ctrl-C interrupted foreground work. |
 | Capture | `herdr pane read <pane> --source recent --lines N` | Small N could return empty below viewport height; a 200-line request plus local trim was stable. |
 | Native state | `herdr agent get <pane>` | Working and done transitions were visible on some harnesses; live Claude Code 2.1.236 on Herdr 0.8.0 kept `agent_status=idle` for an entire landed turn, including a multi-second tool call, so submit confirmation falls through to the shared composer verdict. Native `busy` remains positive activity evidence, while native `idle` cannot close a turn and the adapter's semantic lifecycle decides worker state. |
 | Restart | guarded named-session stop then start | Workspace, tab, pane, and labels persisted; the agent process and registration did not. |
@@ -456,7 +456,7 @@ HERDR_LAB_HELPER=bin/fm-herdr-lab.sh \
 Observed output on Herdr 0.7.5:
 
 ```text
-ok - old path: the explicit last-pane close of a non-focused workspace stole focus (w3	w3:t1 -> w2	w2:t1)
+ok - old path: the explicit last-pane close of a non-focused workspace stole focus (w3 w3:t1 -> w2 w2:t1)
 ok - mitigation: every in-operation sample preserved exact focus while the doomed workspace was removed
 ok - mitigation: no explicit close and no corrective focus were needed on the defective release
 ok - fallback: a doomed pane holding a persistent child exhausts the proof and takes the plain explicit close
@@ -488,7 +488,7 @@ Default-on presentation projection is floored at Herdr 0.8.0.
 The floor's structural signal is the selected running server's protocol number, falling back to the client protocol only when that selected session positively reports no running server, and the release mapping was measured on 2026-08-05 by running each pinned upstream macOS aarch64 release asset's own `status --json` through the guarded lab helper:
 
 | Release | Reported version | Protocol | Carries both upstream focus fixes | Floor verdict |
-|---|---|---|---|---|
+| --- | --- | --- | --- | --- |
 | v0.7.3 | 0.7.3 | 16 | no | below |
 | v0.7.4 | 0.7.4 | 16 | no | below |
 | v0.7.5 | 0.7.5 | 17 | no | below |
@@ -727,7 +727,7 @@ Current active CLI findings:
 | Fresh readiness | `list-panes --workspace <id> --json --id-format uuids` | Found a brand-new surface before content existed. |
 | Fresh read counterexample | `read-screen` before any write | Returned `internal_error: Failed to read terminal text`. |
 | Literal send | `send --workspace <id> --surface <id> -- <text>` | Left text unsubmitted. |
-| Keys | `send-key ... enter|escape|ctrl-c` | All shared key operations worked. |
+| Keys | `send-key ... enter | escape | ctrl-c` | All shared key operations worked. |
 | Nested cwd | `current_directory` plus foreground subshell | Structured cwd froze; the marker-delimited `pwd` probe found the live cwd. |
 | Last surface | `close-surface` on the only surface | Refused with `invalid_state: Cannot close the last surface`. |
 | Last workspace | `close-workspace` on the only workspace in a window | Printed success but left the workspace present. |
@@ -761,6 +761,29 @@ FM_CMUX_CLAUDE_COMPOSER_LIVE=1 bin/fm-test-run.sh tests/fm-cmux-claude-composer-
 
 That guard still addresses the worker by task selector, so it no longer reaches the typed submit path and is not a current refresh entry point for this guarantee.
 The portable classifier regression is `tests/fm-backend-cmux.test.sh`.
+
+## Codex CLI launch autonomy
+
+Crewmate autonomy rides `-c 'approval_policy="never"' -c 'sandbox_mode="danger-full-access"'` rather than `--dangerously-bypass-approvals-and-sandbox`, verified on 2026-08-30 with codex-cli 0.147.0 on Linux.
+The TUI parser refuses the launch with exit 2 when `--dangerously-bypass-approvals-and-sandbox` reaches the command line twice, so any environment layer that also supplies the flag (an environment-supplied `codex` entry point that adds it) kills every crewmate spawn:
+
+```sh
+mkdir -p "$tmp/home"
+printf 'approval_policy = "never"\nsandbox_mode = "danger-full-access"\n' > "$tmp/home/config.toml"
+CODEX_HOME="$tmp/home" codex --dangerously-bypass-approvals-and-sandbox "hi"
+CODEX_HOME="$tmp/home" codex -c 'approval_policy="never"' -c 'sandbox_mode="danger-full-access"' "hi"
+```
+
+Observed for the first command under a duplicate flag:
+
+```text
+error: the argument '--dangerously-bypass-approvals-and-sandbox' cannot be used multiple times
+```
+
+A config granting both keys together with the flag did not trigger the refusal, and the literal duplicate flag was the only launch-blocking combination observed across the config and flag matrix.
+The override pair is equivalent to the flag: `codex exec` headers reported `approval: never` and `sandbox: danger-full-access` for the flag form, the `-c` form, the `-c` form through an entry point that also adds the flag, and the `-c` form over a config already granting both keys.
+The TUI launched under the `-c` form in all four of those environments, and the crewmate `notify` turn-end override still fired.
+`bin/fm-spawn.sh`'s launch template owns the current command shape, and `tests/fm-spawn-dispatch-profile.test.sh` (`test_codex_autonomy_rides_config_overrides_not_the_bypass_flag`) pins it for both an unconfigured home and a routed home whose config grants autonomy.
 
 ## Codex App host tools
 

@@ -410,7 +410,7 @@ test_active_dispatch_profile_allows_explicit_harness() {
   assert_contains "$out" "spawned $id harness=codex" "spawn did not report explicit codex harness"
   assert_meta_profile "$HOME_DIR/state/$id.meta" codex gpt-5 high
   launch=$(cat "$LAUNCH_LOG")
-  assert_contains "$launch" "codex --model 'gpt-5' -c 'model_reasoning_effort=\"high\"' --dangerously-bypass-approvals-and-sandbox" \
+  assert_contains "$launch" "codex --model 'gpt-5' -c 'model_reasoning_effort=\"high\"' -c 'approval_policy=\"never\"' -c 'sandbox_mode=\"danger-full-access\"'" \
     "explicit harness launch did not thread model and effort"
   pass "active crew-dispatch profile allows an explicit resolved harness"
 }
@@ -477,7 +477,7 @@ test_codex_threads_model_and_effort() {
   expect_code 0 "$status" "codex spawn with profile flags should succeed"
   assert_meta_profile "$HOME_DIR/state/$id.meta" codex gpt-5 high
   launch=$(cat "$LAUNCH_LOG")
-  assert_contains "$launch" "codex --model 'gpt-5' -c 'model_reasoning_effort=\"high\"' --dangerously-bypass-approvals-and-sandbox" \
+  assert_contains "$launch" "codex --model 'gpt-5' -c 'model_reasoning_effort=\"high\"' -c 'approval_policy=\"never\"' -c 'sandbox_mode=\"danger-full-access\"'" \
     "codex launch did not thread model and reasoning effort config"
   pass "codex receives --model and model_reasoning_effort profile flags"
 }
@@ -493,10 +493,52 @@ test_codex_omits_invalid_max_effort() {
   expect_code 0 "$status" "codex spawn with unsupported max effort should omit the effort flag"
   assert_meta_profile "$HOME_DIR/state/$id.meta" codex gpt-5 max
   launch=$(cat "$LAUNCH_LOG")
-  assert_contains "$launch" "codex --model 'gpt-5' --dangerously-bypass-approvals-and-sandbox" \
+  assert_contains "$launch" "codex --model 'gpt-5' -c 'approval_policy=\"never\"' -c 'sandbox_mode=\"danger-full-access\"'" \
     "codex launch did not preserve the model flag when max effort was omitted"
   assert_not_contains "$launch" "model_reasoning_effort" "codex launch must omit unsupported max reasoning effort"
   pass "codex omits unsupported max effort instead of passing a bad config value"
+}
+
+test_codex_autonomy_rides_config_overrides_not_the_bypass_flag() {
+  local rec id out status launch
+  id=profile-codex-autonomy-z4b
+  rec=$(make_spawn_case profile-codex-autonomy codex "$id")
+  read_case_record "$rec"
+
+  # Unconfigured Codex home: the launch command is the only autonomy source, so
+  # it must grant never-approve and danger-full-access itself, through the -c
+  # override mechanism rather than the bypass flag.
+  out=$(run_ship_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" "$id" "$PROJ_DIR")
+  status=$?
+  expect_code 0 "$status" "codex spawn without a route account should succeed"
+  launch=$(cat "$LAUNCH_LOG")
+  assert_not_contains "$launch" "--dangerously-bypass-approvals-and-sandbox" \
+    "codex launch must not pass the bypass flag: codex-cli 0.147.0 refuses the TUI launch when the flag reaches the command line twice, and an external codex entry point may already supply it"
+  assert_contains "$launch" "-c 'approval_policy=\"never\"' -c 'sandbox_mode=\"danger-full-access\"'" \
+    "codex launch must grant unattended unrestricted operation through config overrides"
+
+  # Configured Codex home: the selected CODEX_HOME config already grants both
+  # autonomy keys, and the launch must not re-assert autonomy as the
+  # duplicate-prone flag on top of that config.
+  id=profile-codex-autonomy-routed-z4c
+  rec=$(make_spawn_case profile-codex-autonomy-routed codex "$id")
+  read_case_record "$rec"
+  make_account_map "$HOME_DIR" codex-secondary codex CODEX_HOME "$HOME_DIR/codex-2"
+  printf 'approval_policy = "never"\nsandbox_mode = "danger-full-access"\n' > "$HOME_DIR/codex-2/config.toml"
+  reserve_route "$HOME_DIR" "$id" gen-1 codex-sol openai codex-secondary codex-secondary standard medium automatic
+  out=$(run_ship_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" "$id" "$PROJ_DIR" \
+    --harness codex --model gpt-5.6-sol --route-generation gen-1 --route-profile codex-sol \
+    --route-provider openai --route-lane codex-secondary --route-account codex-secondary \
+    --route-class standard --route-work-type implementation --route-risk medium --route-mode automatic)
+  status=$?
+  expect_code 0 "$status" "codex routed spawn with an autonomy-granting config should succeed"
+  launch=$(cat "$LAUNCH_LOG")
+  assert_contains "$launch" "CODEX_HOME='$HOME_DIR/codex-2'" "Codex secondary account was not selected"
+  assert_not_contains "$launch" "--dangerously-bypass-approvals-and-sandbox" \
+    "codex launch must not duplicate autonomy the selected Codex config already grants"
+  assert_contains "$launch" "-c 'approval_policy=\"never\"' -c 'sandbox_mode=\"danger-full-access\"'" \
+    "codex launch must keep unrestricted operation idempotent over a granting config"
+  pass "codex autonomy rides config overrides, never the duplicate-prone bypass flag"
 }
 
 test_grok_threads_model_and_reasoning_effort() {
@@ -1170,6 +1212,7 @@ test_active_dispatch_profile_allows_raw_launch_command
 test_claude_threads_model_and_effort
 test_codex_threads_model_and_effort
 test_codex_omits_invalid_max_effort
+test_codex_autonomy_rides_config_overrides_not_the_bypass_flag
 test_grok_threads_model_and_reasoning_effort
 test_grok_omits_invalid_max_reasoning_effort
 test_grok_omits_invalid_xhigh_reasoning_effort
