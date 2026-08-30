@@ -1,0 +1,3 @@
+warning: secondmate evidence-codex-secondmate sync skipped before launch: primary default-branch commit cannot be resolved
+spawned evidence-codex-secondmate harness=codex kind=secondmate mode=secondmate yolo=off window=firstmate:fm-evidence-codex-secondmate worktree=/tmp/fm-spawn-dispatch-profile.FeiwpA/evidence-secondmate/secondmate-home
+spawn exit=0

@@ -1,0 +1,5 @@
+# bin/fm-spawn.sh reverted to base commit cd8e4ce; test file at target commit
+not ok - codex launch must not pass the bypass flag: codex-cli 0.147.0 refuses the TUI launch when the flag reaches the command line twice, and an external codex entry point may already supply it (unexpected: '--dangerously-bypass-approvals-and-sandbox')
+--- output ---
+env -u CURSOR_AGENT -u CURSOR_INVOKED_AS codex --dangerously-bypass-approvals-and-sandbox -c "notify=[\"bash\",\"-c\",\"touch '/tmp/fm-spawn-dispatch-profile.wZM2OC/profile-codex-autonomy/home/state/profile-codex-autonomy-z4b.turn-ended'\"]" "$('/home/yaro/.no-mistakes/worktrees/a364cdc0cf44/01M197JYAD84QGV2TWWG73TW2C/bin/fm-operational-input.sh' encode launch-brief < '/tmp/fm-spawn-dispatch-profile.wZM2OC/profile-codex-autonomy/home/data/profile-codex-autonomy-z4b/brief.md')"
+exit=1

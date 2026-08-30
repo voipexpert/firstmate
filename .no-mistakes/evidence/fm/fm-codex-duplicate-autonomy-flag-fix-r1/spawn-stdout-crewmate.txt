@@ -1,0 +1,3 @@
+warning: /tmp/fm-spawn-dispatch-profile.FeiwpA/evidence-crewmate/home/data/evidence-codex-crewmate/brief.md records no delivery contract line (scaffolded before ship briefs recorded one); launching on the explicit --mode no-mistakes - confirm its definition of done matches
+spawned evidence-codex-crewmate harness=codex kind=ship mode=no-mistakes yolo=off window=firstmate:fm-evidence-codex-crewmate worktree=/tmp/fm-spawn-dispatch-profile.FeiwpA/evidence-crewmate/wt
+spawn exit=0

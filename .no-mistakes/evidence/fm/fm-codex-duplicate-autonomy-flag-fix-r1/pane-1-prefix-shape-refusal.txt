@@ -1,0 +1,30 @@
+crewmate$ env -u CURSOR_AGENT -u CURSOR_INVOKED_AS codex --dangerously-bypass-approvals-and-sandbox -c "notify=[\"bash
+\",\"-c\",\"touch '/tmp/fm-spawn-dispatch-profile.FeiwpA/evidence-crewmate/home/state/evidence-codex-crewmate.turn-end
+ed'\"]" "$('/home/yaro/.no-mistakes/worktrees/a364cdc0cf44/01M197JYAD84QGV2TWWG73TW2C/bin/fm-operational-input.sh' enc
+ode launch-brief < '/tmp/fm-spawn-dispatch-profile.FeiwpA/evidence-crewmate/home/data/evidence-codex-crewmate/brief.md
+')"
+error: the argument '--dangerously-bypass-approvals-and-sandbox' cannot be used multiple times
+
+Usage: codex [OPTIONS] [PROMPT]
+       codex [OPTIONS] <COMMAND> [ARGS]
+
+For more information, try '--help'.
+crewmate$
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

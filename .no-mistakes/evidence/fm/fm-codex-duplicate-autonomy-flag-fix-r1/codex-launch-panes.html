@@ -1,0 +1,87 @@
+<!doctype html><meta charset="utf-8"><style>
+body{background:#12141a;color:#d8dee9;font:14px/1.5 DejaVu Sans,sans-serif;margin:24px;width:1180px}
+h1{font-size:20px;margin:0 0 4px}
+.sub{color:#9aa5b1;margin:0 0 20px;font-size:13px}
+.cap{margin:18px 0 6px;font-size:13px;color:#c8d0da}
+.cap.bad{border-left:4px solid #e06c75;padding-left:8px}
+.cap.ok{border-left:4px solid #98c379;padding-left:8px}
+pre.term{background:#0b0d12;border:1px solid #2b303b;border-radius:6px;padding:12px 14px;margin:0;
+ font:12.5px/1.35 DejaVu Sans Mono,monospace;color:#e6e6e6;white-space:pre;overflow:hidden}
+pre.term.bad{border-color:#5c2f33}pre.term.ok{border-color:#31502f}
+</style><h1>Codex crewmate launch, real tmux pane + real codex-cli 0.147.0</h1>
+<p class="sub">Launch strings captured from the real bin/fm-spawn.sh, then typed into a live tmux pane with the environment's
+PATH codex wrapper (<code>exec /usr/bin/codex --dangerously-bypass-approvals-and-sandbox "$@"</code>) in place.</p>
+<div class="cap bad">1. BEFORE the fix - launch string with --dangerously-bypass-approvals-and-sandbox, sent into a tmux pane. The PATH codex entry point prepends the same flag, so codex-cli 0.147.0 refuses: exit 2, no crewmate.</div><pre class="term bad">crewmate$ env -u CURSOR_AGENT -u CURSOR_INVOKED_AS codex --dangerously-bypass-approvals-and-sandbox -c &quot;notify=[\&quot;bash
+\&quot;,\&quot;-c\&quot;,\&quot;touch &#x27;/tmp/fm-spawn-dispatch-profile.FeiwpA/evidence-crewmate/home/state/evidence-codex-crewmate.turn-end
+ed&#x27;\&quot;]&quot; &quot;$(&#x27;/home/yaro/.no-mistakes/worktrees/a364cdc0cf44/01M197JYAD84QGV2TWWG73TW2C/bin/fm-operational-input.sh&#x27; enc
+ode launch-brief &lt; &#x27;/tmp/fm-spawn-dispatch-profile.FeiwpA/evidence-crewmate/home/data/evidence-codex-crewmate/brief.md
+&#x27;)&quot;
+error: the argument &#x27;--dangerously-bypass-approvals-and-sandbox&#x27; cannot be used multiple times
+
+Usage: codex [OPTIONS] [PROMPT]
+       codex [OPTIONS] &lt;COMMAND&gt; [ARGS]
+
+For more information, try &#x27;--help&#x27;.
+crewmate$</pre>
+<div class="cap ok">2. AFTER the fix - the shipped crewmate launch string (-c approval_policy=&quot;never&quot; -c sandbox_mode=&quot;danger-full-access&quot;) through the same wrapper: codex reaches its TUI. Identical first screen to the old single-copy flag form (pane-2 capture), so trust behaviour is unchanged.</div><pre class="term ok">&gt; You are in /tmp/fm-spawn-dispatch-profile.FeiwpA/evidence-crewmate/wt
+
+  Note: You’re in a subdirectory of a Git project. Trusting will apply to the repository root:
+  /tmp/fm-spawn-dispatch-profile.FeiwpA/evidence-crewmate/project
+
+  Do you trust the contents of this directory? Working with untrusted contents comes with higher risk of prompt
+  injection. Trusting the directory allows project-local config, hooks, and exec policies to load.
+
+› 1. Yes, continue
+  2. No, quit
+
+  Press enter to continue</pre>
+<div class="cap ok">3. AFTER the fix, past the first-run screen - Codex home with NO autonomy config: permissions read &quot;YOLO mode&quot; and the FIRSTMATE_OP launch brief was delivered. (401 is the deliberate stub API key: no credentialed turn was run.)</div><pre class="term ok">╭─────────────────────────────────────────────╮
+│ &gt;_ OpenAI Codex (v0.147.0)                  │
+│                                             │
+│ model:       gpt-5.6-sol   /model to change │
+│ directory:   /tmp/…/evidence-crewmate/wt    │
+│ permissions: YOLO mode                      │
+╰─────────────────────────────────────────────╯
+
+  Tip: Our most capable model yet. GPT-5.6 Sol can tackle complex code changes, dig into research, produce polished
+  documents, and take on your most ambitious work. Sol is highly capable at lower reasoning efforts—try starting
+  lower, then turn it up for harder jobs.
+
+
+› ⁣FIRSTMATE_OP: v1 launch-brief: brief for evidence-codex-crewmate
+
+
+• Reconnecting... 4/5 (7s • esc to interrupt)
+  └ Unexpected status 401 Unauthorized: {
+      &quot;error, url: wss://api.openai.com/v1/responses, cf-ray: a333ff60ab079798-EWR, request id:
+    req_3898e6a190fd4a18bfa433588d153140, auth error: 401, auth error code: invalid_api_key
+
+
+› Run /review on my current changes
+
+  gpt-5.6-sol default · /tmp/fm-spawn-dispatch-profile.FeiwpA/evidence-crewmate/wt</pre>
+<div class="cap ok">4. AFTER the fix, routed crewmate whose selected CODEX_HOME config already grants approval_policy=&quot;never&quot; and sandbox_mode=&quot;danger-full-access&quot;: the -c pair is idempotent over it, still &quot;YOLO mode&quot;.</div><pre class="term ok">╭─────────────────────────────────────────────╮
+│ &gt;_ OpenAI Codex (v0.147.0)                  │
+│                                             │
+│ model:       gpt-5.6-sol   /model to change │
+│ directory:   /tmp/…/evidence-routed/wt      │
+│ permissions: YOLO mode                      │
+╰─────────────────────────────────────────────╯
+
+  Tip: Our most capable model yet. GPT-5.6 Sol can tackle complex code changes, dig into research, produce polished
+  documents, and take on your most ambitious work. Sol is highly capable at lower reasoning efforts—try starting
+  lower, then turn it up for harder jobs.
+
+
+› ⁣FIRSTMATE_OP: v1 launch-brief: brief for evidence-codex-routed
+
+
+• Reconnecting... 4/5 (7s • esc to interrupt)
+  └ Unexpected status 401 Unauthorized: {
+      &quot;erro, url: wss://api.openai.com/v1/responses, cf-ray: a333ffe41f898c6d-EWR, request id:
+    req_39b26342609347039dd088f0e44038b7, auth error: 401, auth error code: invalid_api_key
+
+
+› Run /review on my current changes
+
+  gpt-5.6-sol default · /tmp/fm-spawn-dispatch-profile.FeiwpA/evidence-routed/wt</pre>

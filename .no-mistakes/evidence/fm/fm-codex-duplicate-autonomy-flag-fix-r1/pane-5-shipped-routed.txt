@@ -1,0 +1,30 @@
+╭─────────────────────────────────────────────╮
+│ >_ OpenAI Codex (v0.147.0)                  │
+│                                             │
+│ model:       gpt-5.6-sol   /model to change │
+│ directory:   /tmp/…/evidence-routed/wt      │
+│ permissions: YOLO mode                      │
+╰─────────────────────────────────────────────╯
+
+  Tip: Our most capable model yet. GPT-5.6 Sol can tackle complex code changes, dig into research, produce polished
+  documents, and take on your most ambitious work. Sol is highly capable at lower reasoning efforts—try starting
+  lower, then turn it up for harder jobs.
+
+
+› ⁣FIRSTMATE_OP: v1 launch-brief: brief for evidence-codex-routed
+
+
+• Reconnecting... 4/5 (7s • esc to interrupt)
+  └ Unexpected status 401 Unauthorized: {
+      "erro, url: wss://api.openai.com/v1/responses, cf-ray: a333ffe41f898c6d-EWR, request id:
+    req_39b26342609347039dd088f0e44038b7, auth error: 401, auth error code: invalid_api_key
+
+
+› Run /review on my current changes
+
+  gpt-5.6-sol default · /tmp/fm-spawn-dispatch-profile.FeiwpA/evidence-routed/wt
+
+
+
+
+

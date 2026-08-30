@@ -1,0 +1,30 @@
+> You are in /tmp/fm-spawn-dispatch-profile.FeiwpA/evidence-crewmate/wt
+
+  Note: You’re in a subdirectory of a Git project. Trusting will apply to the repository root:
+  /tmp/fm-spawn-dispatch-profile.FeiwpA/evidence-crewmate/project
+
+  Do you trust the contents of this directory? Working with untrusted contents comes with higher risk of prompt
+  injection. Trusting the directory allows project-local config, hooks, and exec policies to load.
+
+› 1. Yes, continue
+  2. No, quit
+
+  Press enter to continue
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

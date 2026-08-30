@@ -1,0 +1,3 @@
+# bin/fm-spawn.sh at target commit 0ba8669
+ok - codex autonomy rides config overrides, never the duplicate-prone bypass flag
+exit=0
