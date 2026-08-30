@@ -764,8 +764,8 @@ The portable classifier regression is `tests/fm-backend-cmux.test.sh`.
 
 ## Codex CLI launch autonomy
 
-Crewmate autonomy rides `-c 'approval_policy="never"' -c 'sandbox_mode="danger-full-access"'` rather than `--dangerously-bypass-approvals-and-sandbox`, verified on 2026-08-30 with codex-cli 0.147.0 on Linux.
-codex exits 2 and refuses the launch when that flag reaches the command line twice, so any environment layer that also supplies it - a `codex` entry point that prepends it to every invocation - kills every crewmate spawn.
+Codex crewmate and secondmate autonomy rides `-c 'approval_policy="never"' -c 'sandbox_mode="danger-full-access"'` rather than `--dangerously-bypass-approvals-and-sandbox`, verified on 2026-08-30 with codex-cli 0.147.0 on Linux.
+codex exits 2 and refuses the launch when that flag reaches the command line twice, so any environment layer that also supplies it - a `codex` entry point that prepends it to every invocation - kills every codex spawn.
 In both blocks below `/usr/bin/codex` is the npm JS shim that execs the vendored native binary, `$tmp/bin/codex` is a stub standing in for such an entry point, and the stub key file is there because an unauthenticated `CODEX_HOME` lands on the "Sign in with ChatGPT" screen.
 
 ```sh
@@ -793,7 +793,7 @@ error: the argument '--dangerously-bypass-approvals-and-sandbox' cannot be used 
 
 The third is not refused, and its `codex exec` header reports `approval: never` and `sandbox: danger-full-access` before the stub key fails the API call.
 That home's config grants neither key, so the override pair alone carries the unrestricted posture the flag used to.
-`bin/fm-spawn.sh`'s launch template owns the command shape, and `tests/fm-spawn-dispatch-profile.test.sh` (`test_codex_autonomy_rides_config_overrides_not_the_bypass_flag`) pins it for both an unconfigured home and a routed home whose config grants autonomy.
+`bin/fm-spawn.sh`'s two codex launch templates own the command shape; `tests/fm-spawn-dispatch-profile.test.sh` (`test_codex_autonomy_rides_config_overrides_not_the_bypass_flag`) pins the crewmate shape for both an unconfigured home and a routed home whose config grants autonomy, and `tests/fm-secondmate-harness.test.sh` pins the secondmate shape.
 
 **Directory trust is unchanged by the swap.**
 Both forms were run in the same linked worktree of a bare repo, each with its own `CODEX_HOME` that had never trusted that root; the TUI needs a terminal, and this capture used a 45x120 pseudo-terminal.
